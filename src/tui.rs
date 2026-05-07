@@ -2,13 +2,13 @@ use std::io;
 use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     widgets::{Block, Borders, Gauge, Paragraph, List, ListItem, ListState},
     Terminal,
     style::{Color, Modifier, Style},
@@ -32,10 +32,22 @@ pub struct TuiApp {
     url_buffer: String,
     dir_buffer: String,
     engine_tx: mpsc::Sender<EngineCommand>,
+    default_connections: usize,
+    dry_run: bool,
+    dry_run_size_mb: Option<u64>,
+    borrow_limit_mb: u64,
+    log_root: Option<PathBuf>,
 }
 
 impl TuiApp {
-    pub fn new(engine_tx: mpsc::Sender<EngineCommand>) -> Self {
+    pub fn new(
+        engine_tx: mpsc::Sender<EngineCommand>,
+        default_connections: usize,
+        dry_run: bool,
+        dry_run_size_mb: Option<u64>,
+        borrow_limit_mb: u64,
+        log_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             tasks: Vec::new(),
             list_state: ListState::default(),
@@ -43,6 +55,11 @@ impl TuiApp {
             url_buffer: String::new(),
             dir_buffer: String::new(),
             engine_tx,
+            default_connections,
+            dry_run,
+            dry_run_size_mb,
+            borrow_limit_mb,
+            log_root,
         }
     }
 
@@ -55,9 +72,13 @@ impl TuiApp {
             dir,
             total_size: 0,
             downloaded_size: 0,
-            connections: 8,
+            connections: self.default_connections,
             status: DownloadStatus::Queued,
             speed: 0.0,
+            dry_run: self.dry_run,
+            dry_run_size_mb: self.dry_run_size_mb,
+            borrow_limit_mb: self.borrow_limit_mb,
+            log_root: self.log_root.clone(),
         };
         self.tasks.push(task.clone());
         let _ = self.engine_tx.try_send(EngineCommand::Add(task));
@@ -88,18 +109,22 @@ impl TuiApp {
 
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     match self.input_mode {
                         InputMode::Normal => match key.code {
                             KeyCode::Char('q') => break,
                             KeyCode::Up => self.prev(),
                             KeyCode::Down => self.next(),
-                            KeyCode::Char('n') => {
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
                                 self.input_mode = InputMode::UrlInput;
                                 self.url_buffer.clear();
                             }
-                            KeyCode::Char('s') => self.send_command(EngineCommand::Stop),
-                            KeyCode::Char('r') => self.send_command(EngineCommand::Resume),
-                            KeyCode::Char('c') => self.send_command(EngineCommand::Cancel),
+                            KeyCode::Char('s') | KeyCode::Char('S') => self.send_command(EngineCommand::Stop),
+                            KeyCode::Char('r') | KeyCode::Char('R') => self.send_command(EngineCommand::Resume),
+                            KeyCode::Char('c') | KeyCode::Char('C') => self.send_command(EngineCommand::Cancel),
+
                             _ => {}
                         },
                         InputMode::UrlInput => match key.code {
@@ -237,7 +262,14 @@ impl TuiApp {
                 t.filename.clone()
             };
             let status = format!("{:?}", t.status);
-            ListItem::new(format!("{:<20} | {:<12} | {:.2} MB/s", name, status, t.speed / 1_000_000.0))
+            let mode = if t.dry_run { "dry" } else { "live" };
+            ListItem::new(format!(
+                "{:<20} | {:<12} | {:<4} | {:.2} MB/s",
+                name,
+                status,
+                mode,
+                t.speed / 1_000_000.0
+            ))
         }).collect();
 
         let tasks_list = List::new(items)
@@ -263,7 +295,7 @@ impl TuiApp {
 
         // Input or Commands
         let help_text = match self.input_mode {
-            InputMode::Normal => "[q]uit [n]ew [s]top [r]esume [c]ancel ↑↓ move",
+            InputMode::Normal => "[q]uit [n]ew [s]pause [r]resume [c]persist-stop ↑↓ move",
             InputMode::UrlInput => &format!("Enter URL: {}_", self.url_buffer),
             InputMode::DirInput => &format!("Enter Dir (empty for current): {}_", self.dir_buffer),
         };
