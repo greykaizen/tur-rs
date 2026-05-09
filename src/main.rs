@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod engine;
+pub mod storage;
 pub mod tui;
 
 use std::collections::HashSet;

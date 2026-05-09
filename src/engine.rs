@@ -17,7 +17,7 @@ use hyper::body::Incoming;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -25,6 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 use url::Url;
 use uuid::Uuid;
+
+use crate::storage;
 
 const MB: u64 = 1024 * 1024;
 const INDEX_STATE_MB: u64 = 8;
@@ -38,7 +40,20 @@ const RETRY_BASE_DELAY_MS: u64 = 250;
 const RETRY_MAX_DELAY_MS: u64 = 2_000;
 const DRY_RUN_STEP_BYTES: u64 = 256 * 1024;
 const DRY_RUN_STEP_DELAY_MS: u64 = 4;
-const WRITE_BUFFER_BYTES: usize = MB as usize;
+const WRITE_BUFFER_MIN_BYTES: usize = 64 * 1024;
+const WRITE_BUFFER_MEDIUM_BYTES: usize = 256 * 1024;
+const WRITE_BUFFER_LARGE_BYTES: usize = 512 * 1024;
+const WRITE_BUFFER_MAX_BYTES: usize = MB as usize;
+const WRITE_BUFFER_MEDIUM_SPEED_BPS: u64 = MB;
+const WRITE_BUFFER_LARGE_SPEED_BPS: u64 = 3 * MB;
+const WRITE_BUFFER_MAX_SPEED_BPS: u64 = 6 * MB;
+const HTTP2_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+const HTTP2_MAX_FRAME_BYTES: u32 = 256 * 1024;
+const HTTP2_MAX_SEND_BUFFER_BYTES: usize = 2 * MB as usize;
+const TCP_KEEPALIVE_SECS: u64 = 60;
+const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 20;
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
 const MAX_REDIRECTS: usize = 8;
@@ -625,8 +640,18 @@ async fn run_download_task_local(
 
     let file_path = task.dir.join(&task.filename);
     if !task.dry_run {
-        if let Ok(file) = std::fs::File::create(&file_path) {
-            let _ = file.set_len(total_size);
+        if let Err(err) = storage::prepare_download_file(&file_path, total_size) {
+            let _ = event_tx
+                .send(EngineEvent::StatusChanged(
+                    task.id,
+                    DownloadStatus::Error(format!(
+                        "failed to prepare download file {}: {}",
+                        file_path.display(),
+                        err
+                    )),
+                ))
+                .await;
+            return Ok(());
         }
     }
 
@@ -1209,6 +1234,7 @@ struct AttemptTiming {
 struct PendingWrite {
     start_offset: u64,
     data: Vec<u8>,
+    target_bytes: usize,
 }
 
 impl ConnectionWorker {
@@ -1229,6 +1255,7 @@ impl ConnectionWorker {
         attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
         SchedulerMetrics::add(&self.metrics.file_write_ms, write_ms);
         pending.data.clear();
+        self.trim_pending_write(pending);
         Ok(())
     }
 
@@ -1237,6 +1264,48 @@ impl ConnectionWorker {
             pending.start_offset = offset;
         }
         pending.data.extend_from_slice(data);
+    }
+
+    fn target_write_buffer_bytes(&self, recent_speed_bps: f64) -> usize {
+        let speed_bps = recent_speed_bps.max(0.0) as u64;
+        if speed_bps >= WRITE_BUFFER_MAX_SPEED_BPS {
+            WRITE_BUFFER_MAX_BYTES
+        } else if speed_bps >= WRITE_BUFFER_LARGE_SPEED_BPS {
+            WRITE_BUFFER_LARGE_BYTES
+        } else if speed_bps >= WRITE_BUFFER_MEDIUM_SPEED_BPS {
+            WRITE_BUFFER_MEDIUM_BYTES
+        } else {
+            WRITE_BUFFER_MIN_BYTES
+        }
+    }
+
+    fn update_pending_write_target(&self, pending: &mut PendingWrite, recent_speed_bps: f64) {
+        let target = self.target_write_buffer_bytes(recent_speed_bps);
+        if pending.target_bytes == 0 {
+            pending.target_bytes = target;
+        } else {
+            pending.target_bytes = target;
+        }
+
+        if pending.data.capacity() < pending.target_bytes {
+            pending
+                .data
+                .reserve(pending.target_bytes.saturating_sub(pending.data.capacity()));
+        } else if pending.data.is_empty() {
+            self.trim_pending_write(pending);
+        }
+    }
+
+    fn trim_pending_write(&self, pending: &mut PendingWrite) {
+        let target = pending.target_bytes.max(WRITE_BUFFER_MIN_BYTES);
+        if pending.data.is_empty() && pending.data.capacity() > target.saturating_mul(2) {
+            pending.data.shrink_to(target);
+        }
+    }
+
+    fn reset_pending_write_target(&self, pending: &mut PendingWrite) {
+        pending.target_bytes = WRITE_BUFFER_MIN_BYTES;
+        self.trim_pending_write(pending);
     }
 
     fn update_range_speed_sample(&self, range: &Rc<ActiveRange>, current_cursor: u64) {
@@ -1362,7 +1431,7 @@ impl ConnectionWorker {
     }
 
     async fn run_live(self) -> Result<()> {
-        let mut file = OpenOptions::new().write(true).open(&self.file_path).await?;
+        let mut file = storage::open_download_file_for_write(&self.file_path).await?;
         let mut current_range: Option<Rc<ActiveRange>> = None;
         let mut prefetched_range: Option<Rc<ActiveRange>> = None;
         let mut prefetch_handle: Option<JoinHandle<Result<Option<Rc<ActiveRange>>>>> = None;
@@ -1373,7 +1442,11 @@ impl ConnectionWorker {
         let mut current_range_id: Option<u64> = None;
         let mut consecutive_failures = 0_u32;
         let mut range_wait_started = Instant::now();
-        let mut pending_write = PendingWrite::default();
+        let mut pending_write = PendingWrite {
+            start_offset: 0,
+            data: Vec::with_capacity(WRITE_BUFFER_MIN_BYTES),
+            target_bytes: WRITE_BUFFER_MIN_BYTES,
+        };
 
         loop {
             if self.control.is_halted() {
@@ -1534,11 +1607,6 @@ impl ConnectionWorker {
 
                 let to_write = (max_end - local_cursor).min(chunk.len() as u64) as usize;
                 self.append_pending_write(&mut pending_write, local_cursor, &chunk[..to_write]);
-                if pending_write.data.len() >= WRITE_BUFFER_BYTES {
-                    self
-                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
-                        .await?;
-                }
 
                 let new_pos = local_cursor + to_write as u64;
                 range.cursor.set(new_pos);
@@ -1554,6 +1622,12 @@ impl ConnectionWorker {
                 attempt_timing.chunks = attempt_timing.chunks.saturating_add(1);
                 local_cursor = new_pos;
                 let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
+                self.update_pending_write_target(&mut pending_write, recent_speed_bps);
+                if pending_write.data.len() >= pending_write.target_bytes {
+                    self
+                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .await?;
+                }
 
                 let remaining = max_end.saturating_sub(new_pos);
                 if should_prefetch(remaining, recent_speed_bps, self.borrow_limit_bytes)
@@ -1585,6 +1659,7 @@ impl ConnectionWorker {
                     current_range_id = None;
                     consecutive_failures = 0;
                     range_wait_started = Instant::now();
+                    self.reset_pending_write_target(&mut pending_write);
                     break;
                 }
             }
@@ -1607,6 +1682,7 @@ impl ConnectionWorker {
                         range.cursor.get()
                     ))
                     .await;
+                    self.reset_pending_write_target(&mut pending_write);
                 } else {
                     consecutive_failures = self
                         .handle_range_retry(
@@ -1636,12 +1712,14 @@ impl ConnectionWorker {
                 current_range_id = None;
                 consecutive_failures = 0;
                 range_wait_started = Instant::now();
+                self.reset_pending_write_target(&mut pending_write);
             } else if made_progress_this_attempt {
                 self
                     .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
                     .await?;
                 self.log_attempt_summary(&range, start, end, &attempt_timing, "partial", http_version)
                     .await;
+                self.reset_pending_write_target(&mut pending_write);
             }
         }
 
@@ -2019,6 +2097,10 @@ fn http_version_label(version: Version) -> &'static str {
 fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_keepalive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS)));
+    http.set_keepalive_interval(Some(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS)));
+    http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
     let https = match http_mode {
         HttpMode::Auto => HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -2038,9 +2120,22 @@ fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
             .wrap_connector(http),
     };
 
-    HyperClient::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .build(https)
+    let mut builder = HyperClient::builder(TokioExecutor::new());
+    builder.pool_timer(TokioTimer::new());
+    builder.pool_idle_timeout(Duration::from_secs(30));
+    builder.pool_max_idle_per_host(32);
+    builder.retry_canceled_requests(true);
+    builder.http1_writev(true);
+    builder.http2_adaptive_window(true);
+    builder.http2_initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_BYTES));
+    builder.http2_initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_BYTES));
+    builder.http2_max_frame_size(Some(HTTP2_MAX_FRAME_BYTES));
+    builder.http2_max_send_buf_size(HTTP2_MAX_SEND_BUFFER_BYTES);
+    builder.http2_keep_alive_interval(Some(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS)));
+    builder.http2_keep_alive_timeout(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS * 2));
+    builder.http2_keep_alive_while_idle(true);
+    builder.timer(TokioTimer::new());
+    builder.build(https)
 }
 
 async fn send_request_follow_redirects(
