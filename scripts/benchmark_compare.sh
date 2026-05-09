@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 4 ]]; then
-  echo "usage: $0 <url> <name> [connections] [runs]"
+if [[ $# -lt 2 || $# -gt 7 ]]; then
+  echo "usage: $0 <url> <name> [connections] [runs] [schedule_mode] [http_mode] [tools_csv]"
   exit 1
 fi
 
@@ -10,8 +10,10 @@ URL="$1"
 NAME="$2"
 CONNECTIONS="${3:-4}"
 RUNS="${4:-1}"
+SCHEDULE_MODE="${5:-equal}"
+HTTP_MODE="${6:-http1}"
+TOOLS_CSV="${7:-tur,aria2c,wget,wget2,lftp,axel,curl}"
 
-# Accept schemeless copy-pastes like //host/path and normalize them.
 if [[ "${URL}" == //* ]]; then
   URL="https:${URL}"
 fi
@@ -22,15 +24,30 @@ if [[ ! "${URL}" =~ ^https?:// ]]; then
   exit 1
 fi
 
+IFS=',' read -r -a REQUESTED_TOOLS <<< "${TOOLS_CSV}"
+
+resolve_effective_url() {
+  local url="$1"
+  curl \
+    -L \
+    --silent \
+    --show-error \
+    --output /dev/null \
+    --max-time 20 \
+    --write-out '%{url_effective}' \
+    "${url}"
+}
+
+EFFECTIVE_URL="$(resolve_effective_url "${URL}" 2>/dev/null || true)"
+if [[ -z "${EFFECTIVE_URL}" ]]; then
+  EFFECTIVE_URL="${URL}"
+fi
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
 ROOT_DIR="benchmarks/runs/${STAMP}-${NAME}"
-TUR_DIR="${ROOT_DIR}/tur"
-ARIA_DIR="${ROOT_DIR}/aria2c"
+SUMMARY="${ROOT_DIR}/summary.tsv"
 
-mkdir -p "${TUR_DIR}/downloads" "${TUR_DIR}/logs" "${ARIA_DIR}/downloads" "${ARIA_DIR}/logs"
-
-echo "building release binary..."
-cargo build --release
+mkdir -p "${ROOT_DIR}"
 
 format_mb_s() {
   local bps="${1:-0}"
@@ -41,6 +58,15 @@ read_kv() {
   local file="$1"
   local key="$2"
   grep -F "${key}=" "${file}" 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+}
+
+tool_binary_available() {
+  local tool="$1"
+  case "${tool}" in
+    tur) return 0 ;;
+    aria2c|wget|wget2|lftp|axel|curl) command -v "${tool}" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
 }
 
 show_live_status() {
@@ -67,8 +93,7 @@ show_live_status() {
 run_and_measure() {
   local prefix="$1"
   local label="$2"
-  shift
-  shift
+  shift 2
 
   local stdout_log="${prefix}/stdout.log"
   local time_log="${prefix}/time.log"
@@ -143,67 +168,190 @@ probe_network() {
     }
 }
 
-for RUN in $(seq 1 "${RUNS}"); do
-  RUN_NAME="run-${RUN}"
-  TUR_RUN_DIR="${TUR_DIR}/${RUN_NAME}"
-  ARIA_RUN_DIR="${ARIA_DIR}/${RUN_NAME}"
+build_tool_command() {
+  local tool="$1"
+  local run_dir="$2"
+  local downloads_dir="${run_dir}/downloads"
+  local logs_dir="${run_dir}/logs"
+  local out_name="${NAME}"
 
-  mkdir -p "${TUR_RUN_DIR}/downloads" "${TUR_RUN_DIR}/logs" "${ARIA_RUN_DIR}/downloads" "${ARIA_RUN_DIR}/logs"
+  case "${tool}" in
+    tur)
+      printf '%s\n' \
+        "./target/release/tur --headless --url \"${EFFECTIVE_URL}\" --dir \"${downloads_dir}\" --connections ${CONNECTIONS} --schedule-mode ${SCHEDULE_MODE} --http-mode ${HTTP_MODE} --log-root \"${logs_dir}\""
+      ;;
+    aria2c)
+      printf '%s\n' \
+        "aria2c --dir=\"${downloads_dir}\" --out=\"${out_name}\" --max-connection-per-server=${CONNECTIONS} --split=${CONNECTIONS} --min-split-size=1M --file-allocation=none --log=\"${logs_dir}/aria2c.log\" \"${EFFECTIVE_URL}\""
+      ;;
+    wget)
+      printf '%s\n' \
+        "wget --no-config --output-file=\"${logs_dir}/wget.log\" --output-document=\"${downloads_dir}/${out_name}\" \"${EFFECTIVE_URL}\""
+      ;;
+    wget2)
+      printf '%s\n' \
+        "wget2 --output-file=\"${logs_dir}/wget2.log\" --output-document=\"${downloads_dir}/${out_name}\" --chunk-size=1M --max-threads=${CONNECTIONS} \"${EFFECTIVE_URL}\""
+      ;;
+    lftp)
+      printf '%s\n' \
+        "lftp --norc -c 'set xfer:clobber true; pget -n ${CONNECTIONS} -O \"${downloads_dir}\" \"${EFFECTIVE_URL}\" -o \"${out_name}\"; bye'"
+      ;;
+    axel)
+      printf '%s\n' \
+        "axel --num-connections=${CONNECTIONS} --output=\"${downloads_dir}/${out_name}\" \"${EFFECTIVE_URL}\""
+      ;;
+    curl)
+      printf '%s\n' \
+        "curl -L --fail --silent --show-error --output \"${downloads_dir}/${out_name}\" \"${EFFECTIVE_URL}\""
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
-  TUR_OUT_NAME="${NAME}"
-  ARIA_OUT_NAME="${NAME}"
+run_tool() {
+  local tool="$1"
+  local run_dir="$2"
+  local downloads_dir="${run_dir}/downloads"
+  local logs_dir="${run_dir}/logs"
+  local out_name="${NAME}"
 
-  echo
-  echo "== ${RUN_NAME}/${RUNS} tur =="
-  printf '%s\n' \
-    "./target/release/tur --headless --url ${URL} --dir ${TUR_RUN_DIR}/downloads --connections ${CONNECTIONS} --log-root ${TUR_RUN_DIR}/logs" \
-    > "${TUR_RUN_DIR}/command.txt"
-  probe_network "${TUR_RUN_DIR}" "${URL}"
-  run_and_measure "${TUR_RUN_DIR}" "tur ${RUN_NAME}" \
-    ./target/release/tur \
-    --headless \
-    --url "${URL}" \
-    --dir "${TUR_RUN_DIR}/downloads" \
-    --connections "${CONNECTIONS}" \
-    --log-root "${TUR_RUN_DIR}/logs"
-  echo "tur ${RUN_NAME}: elapsed=$(read_kv "${TUR_RUN_DIR}/time.log" "elapsed_seconds")s rss=$(read_kv "${TUR_RUN_DIR}/time.log" "peak_rss_kb")KB status=$(read_kv "${TUR_RUN_DIR}/time.log" "exit_status") probe=$(format_mb_s "$(read_kv "${TUR_RUN_DIR}/network_probe.log" "speed_download_Bps")")MiB/s"
+  case "${tool}" in
+    tur)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        ./target/release/tur \
+        --headless \
+        --url "${EFFECTIVE_URL}" \
+        --dir "${downloads_dir}" \
+        --connections "${CONNECTIONS}" \
+        --schedule-mode "${SCHEDULE_MODE}" \
+        --http-mode "${HTTP_MODE}" \
+        --log-root "${logs_dir}"
+      ;;
+    aria2c)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        aria2c \
+        --dir="${downloads_dir}" \
+        --out="${out_name}" \
+        --max-connection-per-server="${CONNECTIONS}" \
+        --split="${CONNECTIONS}" \
+        --min-split-size=1M \
+        --file-allocation=none \
+        --log="${logs_dir}/aria2c.log" \
+        "${EFFECTIVE_URL}"
+      ;;
+    wget)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        wget \
+        --no-config \
+        --output-file="${logs_dir}/wget.log" \
+        --output-document="${downloads_dir}/${out_name}" \
+        "${EFFECTIVE_URL}"
+      ;;
+    wget2)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        wget2 \
+        --output-file="${logs_dir}/wget2.log" \
+        --output-document="${downloads_dir}/${out_name}" \
+        --chunk-size=1M \
+        --max-threads="${CONNECTIONS}" \
+        "${EFFECTIVE_URL}"
+      ;;
+    lftp)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        lftp \
+        --norc \
+        -c "set xfer:clobber true; pget -n ${CONNECTIONS} -O \"${downloads_dir}\" \"${EFFECTIVE_URL}\" -o \"${out_name}\"; bye"
+      ;;
+    axel)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        axel \
+        --num-connections="${CONNECTIONS}" \
+        --output="${downloads_dir}/${out_name}" \
+        "${EFFECTIVE_URL}"
+      ;;
+    curl)
+      run_and_measure "${run_dir}" "${tool} ${RUN_NAME}" \
+        curl \
+        -L \
+        --fail \
+        --silent \
+        --show-error \
+        --output "${downloads_dir}/${out_name}" \
+        "${EFFECTIVE_URL}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
-  echo
-  echo "== ${RUN_NAME}/${RUNS} aria2c =="
-  printf '%s\n' \
-    "aria2c --dir=${ARIA_RUN_DIR}/downloads --out=${ARIA_OUT_NAME} --max-connection-per-server=${CONNECTIONS} --split=${CONNECTIONS} --min-split-size=1M --file-allocation=none --log=${ARIA_RUN_DIR}/logs/aria2c.log ${URL}" \
-    > "${ARIA_RUN_DIR}/command.txt"
-  probe_network "${ARIA_RUN_DIR}" "${URL}"
-  run_and_measure "${ARIA_RUN_DIR}" "aria2c ${RUN_NAME}" \
-    aria2c \
-    --dir="${ARIA_RUN_DIR}/downloads" \
-    --out="${ARIA_OUT_NAME}" \
-    --max-connection-per-server="${CONNECTIONS}" \
-    --split="${CONNECTIONS}" \
-    --min-split-size=1M \
-    --file-allocation=none \
-    --log="${ARIA_RUN_DIR}/logs/aria2c.log" \
-    "${URL}"
-  echo "aria2c ${RUN_NAME}: elapsed=$(read_kv "${ARIA_RUN_DIR}/time.log" "elapsed_seconds")s rss=$(read_kv "${ARIA_RUN_DIR}/time.log" "peak_rss_kb")KB status=$(read_kv "${ARIA_RUN_DIR}/time.log" "exit_status") probe=$(format_mb_s "$(read_kv "${ARIA_RUN_DIR}/network_probe.log" "speed_download_Bps")")MiB/s"
+AVAILABLE_TOOLS=()
+for tool in "${REQUESTED_TOOLS[@]}"; do
+  if tool_binary_available "${tool}"; then
+    AVAILABLE_TOOLS+=("${tool}")
+  else
+    echo "skipping unavailable tool: ${tool}"
+  fi
 done
 
-SUMMARY="${ROOT_DIR}/summary.tsv"
+if [[ "${#AVAILABLE_TOOLS[@]}" -eq 0 ]]; then
+  echo "error: no benchmark tools available"
+  exit 1
+fi
+
+if [[ " ${AVAILABLE_TOOLS[*]} " != *" tur "* ]]; then
+  AVAILABLE_TOOLS=(tur "${AVAILABLE_TOOLS[@]}")
+fi
+
+echo "building release binary..."
+cargo build --release
+echo "original url: ${URL}"
+echo "effective url: ${EFFECTIVE_URL}"
+echo "schedule mode: ${SCHEDULE_MODE}"
+echo "http mode: ${HTTP_MODE}"
+echo "tools: ${AVAILABLE_TOOLS[*]}"
+
+for tool in "${AVAILABLE_TOOLS[@]}"; do
+  mkdir -p "${ROOT_DIR}/${tool}"
+done
+
+for RUN in $(seq 1 "${RUNS}"); do
+  RUN_NAME="run-${RUN}"
+  echo
+  echo "== ${RUN_NAME}/${RUNS} =="
+
+  for tool in "${AVAILABLE_TOOLS[@]}"; do
+    TOOL_RUN_DIR="${ROOT_DIR}/${tool}/${RUN_NAME}"
+    mkdir -p "${TOOL_RUN_DIR}/downloads" "${TOOL_RUN_DIR}/logs"
+
+    echo
+    echo "-- ${tool} --"
+    build_tool_command "${tool}" "${TOOL_RUN_DIR}" > "${TOOL_RUN_DIR}/command.txt"
+    probe_network "${TOOL_RUN_DIR}" "${EFFECTIVE_URL}"
+    run_tool "${tool}" "${TOOL_RUN_DIR}"
+    echo "${tool} ${RUN_NAME}: elapsed=$(read_kv "${TOOL_RUN_DIR}/time.log" "elapsed_seconds")s rss=$(read_kv "${TOOL_RUN_DIR}/time.log" "peak_rss_kb")KB status=$(read_kv "${TOOL_RUN_DIR}/time.log" "exit_status") probe=$(format_mb_s "$(read_kv "${TOOL_RUN_DIR}/network_probe.log" "speed_download_Bps")")MiB/s"
+  done
+done
+
 printf "tool\trun\telapsed_seconds\tpeak_rss_kb\texit_status\tprobe_speed_Bps\tprobe_total_s\tprobe_connect_s\tprobe_ttfb_s\tprobe_bytes\n" > "${SUMMARY}"
 
-for TOOL in tur aria2c; do
-  for RUN_PATH in "${ROOT_DIR}/${TOOL}"/run-*; do
-    RUN_BASENAME="$(basename "${RUN_PATH}")"
-    ELAPSED="$(grep -F "elapsed_seconds=" "${RUN_PATH}/time.log" | cut -d= -f2)"
-    MAX_RSS="$(grep -F "peak_rss_kb=" "${RUN_PATH}/time.log" | cut -d= -f2)"
-    STATUS="$(grep -F "exit_status=" "${RUN_PATH}/time.log" | cut -d= -f2)"
-    PROBE_SPEED="$(grep -F "speed_download_Bps=" "${RUN_PATH}/network_probe.log" | cut -d= -f2 || true)"
-    PROBE_TOTAL="$(grep -F "time_total_s=" "${RUN_PATH}/network_probe.log" | cut -d= -f2 || true)"
-    PROBE_CONNECT="$(grep -F "time_connect_s=" "${RUN_PATH}/network_probe.log" | cut -d= -f2 || true)"
-    PROBE_TTFB="$(grep -F "time_starttransfer_s=" "${RUN_PATH}/network_probe.log" | cut -d= -f2 || true)"
-    PROBE_BYTES="$(grep -F "size_download=" "${RUN_PATH}/network_probe.log" | cut -d= -f2 || true)"
+for tool in "${AVAILABLE_TOOLS[@]}"; do
+  for run_path in "${ROOT_DIR}/${tool}"/run-*; do
+    [[ -d "${run_path}" ]] || continue
+    run_basename="$(basename "${run_path}")"
+    elapsed="$(grep -F "elapsed_seconds=" "${run_path}/time.log" | cut -d= -f2)"
+    max_rss="$(grep -F "peak_rss_kb=" "${run_path}/time.log" | cut -d= -f2)"
+    status="$(grep -F "exit_status=" "${run_path}/time.log" | cut -d= -f2)"
+    probe_speed="$(grep -F "speed_download_Bps=" "${run_path}/network_probe.log" | cut -d= -f2 || true)"
+    probe_total="$(grep -F "time_total_s=" "${run_path}/network_probe.log" | cut -d= -f2 || true)"
+    probe_connect="$(grep -F "time_connect_s=" "${run_path}/network_probe.log" | cut -d= -f2 || true)"
+    probe_ttfb="$(grep -F "time_starttransfer_s=" "${run_path}/network_probe.log" | cut -d= -f2 || true)"
+    probe_bytes="$(grep -F "size_download=" "${run_path}/network_probe.log" | cut -d= -f2 || true)"
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-      "${TOOL}" "${RUN_BASENAME}" "${ELAPSED}" "${MAX_RSS}" "${STATUS}" \
-      "${PROBE_SPEED}" "${PROBE_TOTAL}" "${PROBE_CONNECT}" "${PROBE_TTFB}" "${PROBE_BYTES}" \
+      "${tool}" "${run_basename}" "${elapsed}" "${max_rss}" "${status}" \
+      "${probe_speed}" "${probe_total}" "${probe_connect}" "${probe_ttfb}" "${probe_bytes}" \
       >> "${SUMMARY}"
   done
 done
@@ -242,7 +390,7 @@ print_final_summary() {
 print_run_verdicts() {
   local summary="$1"
   echo
-  echo "== run verdicts =="
+  echo "== run verdicts vs tur =="
   awk -F'\t' '
     NR == 1 { next }
     {
@@ -251,62 +399,80 @@ print_run_verdicts() {
       elapsed[run, tool] = $3 + 0
       rss[run, tool] = $4 + 0
       probe[run, tool] = ($6 == "" ? -1 : $6 + 0)
-      seen[run] = 1
+      seen_runs[run] = 1
+      seen_tools[tool] = 1
     }
     END {
-      for (run in seen) {
+      for (run in seen_runs) {
         tur_elapsed = elapsed[run, "tur"]
-        aria_elapsed = elapsed[run, "aria2c"]
         tur_rss = rss[run, "tur"]
-        aria_rss = rss[run, "aria2c"]
         tur_probe = probe[run, "tur"]
-        aria_probe = probe[run, "aria2c"]
-
-        speed_gap_s = tur_elapsed - aria_elapsed
-        speed_gap_pct = (aria_elapsed > 0 ? (speed_gap_s / aria_elapsed) * 100.0 : 0)
-        rss_gap_kb = aria_rss - tur_rss
-        rss_gap_pct = (aria_rss > 0 ? (rss_gap_kb / aria_rss) * 100.0 : 0)
-
-        if (speed_gap_s <= -5) {
-          speed_label = "GOOD for tur"
-        } else if (speed_gap_s < 5) {
-          speed_label = "CLOSE"
-        } else {
-          speed_label = "BAD for tur"
-        }
-
-        if (rss_gap_kb > 0) {
-          memory_label = "GOOD for tur"
-        } else if (rss_gap_kb < 0) {
-          memory_label = "BAD for tur"
-        } else {
-          memory_label = "TIED"
-        }
-
-        probe_label = "probe unavailable"
-        if (tur_probe > 0 && aria_probe > 0) {
-          ratio = tur_probe / aria_probe
-          if (ratio < 0.70 || ratio > 1.30) {
-            probe_label = "network skewed"
-          } else {
-            probe_label = "network roughly comparable"
+        for (tool in seen_tools) {
+          if (tool == "tur") {
+            continue
           }
-        } else if (tur_probe > 0 || aria_probe > 0) {
-          probe_label = "probe incomplete"
-        }
+          other_elapsed = elapsed[run, tool]
+          other_rss = rss[run, tool]
+          other_probe = probe[run, tool]
+          if (other_elapsed == 0 && other_rss == 0) {
+            continue
+          }
 
-        printf "%s: speed=%s (tur %.3fs vs aria2c %.3fs, %+0.3fs / %+0.1f%%), memory=%s (tur %dKB vs aria2c %dKB, tur uses %.1f%% less), probe=%s\n",
-          run,
-          speed_label,
-          tur_elapsed,
-          aria_elapsed,
-          -speed_gap_s,
-          -speed_gap_pct,
-          memory_label,
-          tur_rss,
-          aria_rss,
-          rss_gap_pct,
-          probe_label
+          speed_gap_s = tur_elapsed - other_elapsed
+          speed_gap_pct = (other_elapsed > 0 ? (speed_gap_s / other_elapsed) * 100.0 : 0)
+          rss_gap_kb = other_rss - tur_rss
+          rss_gap_pct = (other_rss > 0 ? (rss_gap_kb / other_rss) * 100.0 : 0)
+
+          close_threshold_s = 5
+          close_threshold_pct = 10
+          if (other_elapsed > 0 && (other_elapsed * close_threshold_pct / 100.0) > close_threshold_s) {
+            close_threshold_s = other_elapsed * close_threshold_pct / 100.0
+          }
+
+          if (speed_gap_s <= -close_threshold_s) {
+            speed_label = "GOOD for tur"
+          } else if (speed_gap_s < close_threshold_s) {
+            speed_label = "CLOSE"
+          } else {
+            speed_label = "BAD for tur"
+          }
+
+          if (rss_gap_kb > 0) {
+            memory_label = "GOOD for tur"
+          } else if (rss_gap_kb < 0) {
+            memory_label = "BAD for tur"
+          } else {
+            memory_label = "TIED"
+          }
+
+          probe_label = "probe unavailable"
+          if (tur_probe > 0 && other_probe > 0) {
+            ratio = tur_probe / other_probe
+            if (ratio < 0.70 || ratio > 1.30) {
+              probe_label = "network skewed"
+            } else {
+              probe_label = "network roughly comparable"
+            }
+          } else if (tur_probe > 0 || other_probe > 0) {
+            probe_label = "probe incomplete"
+          }
+
+          printf "%s vs %s: speed=%s (tur %.3fs vs %s %.3fs, %+0.3fs / %+0.1f%%), memory=%s (tur %dKB vs %s %dKB, tur uses %.1f%% less), probe=%s\n",
+            run,
+            tool,
+            speed_label,
+            tur_elapsed,
+            tool,
+            other_elapsed,
+            -speed_gap_s,
+            -speed_gap_pct,
+            memory_label,
+            tur_rss,
+            tool,
+            other_rss,
+            rss_gap_pct,
+            probe_label
+        }
       }
     }
   ' "${summary}"
@@ -314,7 +480,7 @@ print_run_verdicts() {
   echo "guide:"
   echo "  GOOD for tur speed: tur is meaningfully faster"
   echo "  BAD for tur speed: tur is meaningfully slower"
-  echo "  CLOSE: speed gap is small enough that more runs are needed"
+  echo "  CLOSE: speed gap is under 5s or 10%, so more runs are needed"
   echo "  network skewed: probe speeds differed too much, so the run is not a clean fairness check"
 }
 
