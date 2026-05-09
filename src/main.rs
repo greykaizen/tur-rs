@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use cli::Cli;
-use engine::{DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent};
+use engine::{DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ScheduleMode};
 use tui::TuiApp;
 
 #[tokio::main]
@@ -21,6 +21,9 @@ async fn main() -> Result<()> {
     if cli.headless {
         return run_headless(cli).await;
     }
+
+    let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
+    let http_mode = HttpMode::parse(&cli.http_mode)?;
 
     let connections = cli.connections;
     let tasks_limit = cli.tasks;
@@ -42,6 +45,8 @@ async fn main() -> Result<()> {
         cli.dry_run,
         cli.dry_run_size_mb,
         cli.borrow_limit_mb,
+        schedule_mode,
+        http_mode,
         cli.log_root.clone().map(PathBuf::from),
     );
 
@@ -58,6 +63,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_headless(cli: Cli) -> Result<()> {
+    let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
+    let http_mode = HttpMode::parse(&cli.http_mode)?;
     let connections = cli.connections;
     let tasks_limit = cli.tasks;
 
@@ -90,6 +97,8 @@ async fn run_headless(cli: Cli) -> Result<()> {
             dry_run: cli.dry_run,
             dry_run_size_mb: cli.dry_run_size_mb,
             borrow_limit_mb: cli.borrow_limit_mb,
+            schedule_mode,
+            http_mode,
             log_root: log_root.clone(),
         })
         .collect();

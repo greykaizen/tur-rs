@@ -35,6 +35,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     pub borrow_limit_mb: u64,
 
+    /// Scheduler mode: equal or fib
+    #[arg(long, default_value = "equal")]
+    pub schedule_mode: String,
+
+    /// HTTP transport mode: auto, http1, or http2
+    #[arg(long, default_value = "http1")]
+    pub http_mode: String,
+
     /// Run without the TUI and exit when tasks finish
     #[arg(long, default_value_t = false)]
     pub headless: bool,

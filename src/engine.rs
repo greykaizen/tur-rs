@@ -6,22 +6,31 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
-use futures_util::StreamExt;
+use bytes::Bytes;
+use http::header::{ACCEPT, CONTENT_LENGTH, LOCATION, RANGE, USER_AGENT};
+use http::{Method, Request, Uri, Version};
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
+use url::Url;
 use uuid::Uuid;
 
 const MB: u64 = 1024 * 1024;
 const INDEX_STATE_MB: u64 = 8;
 const INDEX_STATE_BYTES: u64 = INDEX_STATE_MB * MB;
 const DEFAULT_BORROW_LIMIT_MB: u64 = 2;
-const LIVE_SEED_FLOOR_MB: u64 = 8;
+const LIVE_SEED_FLOOR_MB: u64 = 13;
 const LIVE_PREFETCH_MIN_MB: u64 = 2;
 const LIVE_PREFETCH_HANDSHAKE_MS: u64 = 700;
 const MAX_RANGE_RETRIES: u32 = 8;
@@ -29,8 +38,13 @@ const RETRY_BASE_DELAY_MS: u64 = 250;
 const RETRY_MAX_DELAY_MS: u64 = 2_000;
 const DRY_RUN_STEP_BYTES: u64 = 256 * 1024;
 const DRY_RUN_STEP_DELAY_MS: u64 = 4;
+const WRITE_BUFFER_BYTES: usize = MB as usize;
 const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
+const MAX_REDIRECTS: usize = 8;
+const USER_AGENT_VALUE: &str = concat!("tur/", env!("CARGO_PKG_VERSION"));
+
+type DownloadHttpClient = HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DownloadStatus {
@@ -56,7 +70,54 @@ pub struct DownloadTask {
     pub dry_run: bool,
     pub dry_run_size_mb: Option<u64>,
     pub borrow_limit_mb: u64,
+    pub schedule_mode: ScheduleMode,
+    pub http_mode: HttpMode,
     pub log_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScheduleMode {
+    Fib,
+    FibAdaptive,
+    Equal,
+}
+
+impl ScheduleMode {
+    pub fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "fib" => Ok(Self::Fib),
+            "fib-adaptive" | "fib_adaptive" | "adaptive-fib" | "adaptive_fib" => Ok(Self::FibAdaptive),
+            "equal" => Ok(Self::Equal),
+            other => Err(anyhow!("unsupported schedule mode: {}", other)),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fib => "fib",
+            Self::FibAdaptive => "fib-adaptive",
+            Self::Equal => "equal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpMode {
+    Auto,
+    Http1,
+    Http2,
+}
+
+impl HttpMode {
+    pub fn parse(input: &str) -> Result<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "http1" | "http/1.1" | "h1" => Ok(Self::Http1),
+            "http2" | "http/2" | "h2" => Ok(Self::Http2),
+            other => Err(anyhow!("unsupported http mode: {}", other)),
+        }
+    }
+
 }
 
 #[derive(Debug)]
@@ -70,6 +131,9 @@ pub struct ActiveRange {
     pub end: Cell<u64>,
     pub parent_range_id: Option<u64>,
     pub status: Cell<u8>,
+    pub last_sample_cursor: Cell<u64>,
+    pub last_sample_at_ms: Cell<u64>,
+    pub recent_speed_bps: Cell<u64>,
 }
 
 #[derive(Debug)]
@@ -144,6 +208,8 @@ struct SchedulerMetrics {
     direct_assignments: Cell<u64>,
     borrow_assignments: Cell<u64>,
     bytes_borrowed: Cell<u64>,
+    straggler_splits: Cell<u64>,
+    tail_splits: Cell<u64>,
     work_requests: Cell<u64>,
     request_wait_ms: Cell<u64>,
     prefetch_requests: Cell<u64>,
@@ -162,10 +228,12 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
+            self.straggler_splits.get(),
+            self.tail_splits.get(),
             self.work_requests.get(),
             self.request_wait_ms.get(),
             self.prefetch_requests.get(),
@@ -207,6 +275,23 @@ const RANGE_STATUS_ACTIVE: u8 = 1;
 const RANGE_STATUS_FINISHED: u8 = 2;
 const UNASSIGNED_CONNECTION: u32 = u32::MAX;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BorrowKind {
+    Standard,
+    Straggler,
+    Tail,
+}
+
+impl BorrowKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Straggler => "straggler",
+            Self::Tail => "tail",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DlRangeSnapshot {
     id: u64,
@@ -243,6 +328,7 @@ struct Coordinator {
     borrow_limit_bytes: u64,
     borrow_cursor: usize,
     next_range_id: u64,
+    total_size: u64,
     index_state: Rc<IndexStateMap>,
     log_file: StdFile,
     metrics: Rc<SchedulerMetrics>,
@@ -517,6 +603,7 @@ async fn run_download_task_local(
             snapshot.coordinator,
             snapshot.task.total_size,
             &log_path,
+            task.schedule_mode,
             metrics.clone(),
         )?
     } else {
@@ -527,6 +614,7 @@ async fn run_download_task_local(
             task.borrow_limit_mb,
             task.connections,
             task.dry_run,
+            task.schedule_mode,
             metrics.clone(),
         )?
     };
@@ -544,10 +632,7 @@ async fn run_download_task_local(
 
     let (work_tx, work_rx) = mpsc::channel(128);
     let mut handles = Vec::with_capacity(task.connections);
-    let http_client = reqwest::Client::builder()
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .build()?;
+    let http_client = build_http_client(task.http_mode);
 
     for connection_id in 0..task.connections {
         let worker = ConnectionWorker {
@@ -649,11 +734,11 @@ async fn resolve_total_size(task: &DownloadTask) -> Result<u64> {
         }
     }
 
-    let client = reqwest::Client::new();
-    let res = client.head(&task.url).send().await?;
+    let client = build_http_client(task.http_mode);
+    let res = send_request_follow_redirects(&client, Method::HEAD, &task.url, None).await?;
     let total_size = res
         .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
+        .get(CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
@@ -673,6 +758,7 @@ impl Coordinator {
         borrow_limit_mb: u64,
         connections: usize,
         dry_run: bool,
+        schedule_mode: ScheduleMode,
         metrics: Rc<SchedulerMetrics>,
     ) -> Result<Self> {
         let fib_mb = build_fib_mb();
@@ -682,8 +768,24 @@ impl Coordinator {
             .position(|value| *value >= ceil_mb.max(1))
             .ok_or_else(|| anyhow!("Download exceeds generated Fibonacci range table"))?;
 
-    let seed_start_idx = choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
-        let seed_ranges = build_seed_ranges(&fib_mb, seed_start_idx, support_idx, total_size);
+        let seed_start_idx = match schedule_mode {
+            ScheduleMode::FibAdaptive => choose_adaptive_seed_start_idx(
+                &fib_mb,
+                support_idx,
+                total_size,
+                connections.max(1),
+                dry_run,
+            ),
+            _ => choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run),
+        };
+        let seed_ranges = build_initial_ranges(
+            &fib_mb,
+            seed_start_idx,
+            support_idx,
+            total_size,
+            connections.max(1),
+            schedule_mode,
+        );
         let dl_ranges: Vec<Rc<ActiveRange>> = seed_ranges
             .iter()
             .map(|spec| {
@@ -697,6 +799,9 @@ impl Coordinator {
                     end: Cell::new(spec.byte_end),
                     parent_range_id: None,
                     status: Cell::new(RANGE_STATUS_PENDING),
+                    last_sample_cursor: Cell::new(spec.byte_start),
+                    last_sample_at_ms: Cell::new(0),
+                    recent_speed_bps: Cell::new(0),
                 })
             })
             .collect();
@@ -707,16 +812,18 @@ impl Coordinator {
             borrow_limit_bytes: borrow_limit_mb.max(1) * MB,
             borrow_cursor: 0,
             next_range_id: seed_ranges.len() as u64 + 1,
+            total_size,
             index_state: Rc::new(IndexStateMap::new(total_size)),
             log_file: StdFile::create(log_path)?,
             metrics,
         };
 
         coordinator.log(&format!(
-            "Coordinator started for task={} total_size={}B ceil_mb={} seed_floor_mb={} seed_start={}MB support_end={}MB borrow_limit={}MB dry_run={} index_state_bucket_mb={} index_state_buckets={} index_state_bytes={}",
+            "Coordinator started for task={} total_size={}B ceil_mb={} schedule_mode={} seed_floor_mb={} seed_start={}MB support_end={}MB borrow_limit={}MB dry_run={} index_state_bucket_mb={} index_state_buckets={} index_state_bytes={}",
             task_id,
             total_size,
             ceil_mb,
+            schedule_mode.as_str(),
             if dry_run { 1 } else { LIVE_SEED_FLOOR_MB },
             fib_mb[seed_start_idx],
             fib_mb[support_idx],
@@ -752,6 +859,7 @@ impl Coordinator {
         snapshot: CoordinatorSnapshot,
         total_size: u64,
         log_path: &Path,
+        _schedule_mode: ScheduleMode,
         metrics: Rc<SchedulerMetrics>,
     ) -> Result<Self> {
         let dl_ranges = snapshot
@@ -768,6 +876,9 @@ impl Coordinator {
                     end: Cell::new(range.end),
                     parent_range_id: range.parent_range_id,
                     status: Cell::new(range.status),
+                    last_sample_cursor: Cell::new(range.cursor),
+                    last_sample_at_ms: Cell::new(0),
+                    recent_speed_bps: Cell::new(0),
                 })
             })
             .collect();
@@ -778,6 +889,7 @@ impl Coordinator {
             borrow_limit_bytes: snapshot.borrow_limit_bytes,
             borrow_cursor: snapshot.borrow_cursor,
             next_range_id: snapshot.next_range_id,
+            total_size,
             index_state: Rc::new(IndexStateMap::from_snapshot(total_size, snapshot.index_state_bits)),
             log_file: std::fs::OpenOptions::new()
                 .create(true)
@@ -858,71 +970,188 @@ impl Coordinator {
             return None;
         }
 
+        if let Some((idx, kind)) = self.select_borrow_candidate(connection_id) {
+            return self.split_active_range(idx, connection_id, kind);
+        }
+
+        None
+    }
+
+    fn select_borrow_candidate(&self, connection_id: u32) -> Option<(usize, BorrowKind)> {
+        let effective_limit = self.effective_borrow_limit_bytes();
+        let mut active_speeds = Vec::new();
+        for range in &self.dl_ranges {
+            let owner_connection = range.assigned_to.get();
+            if owner_connection == connection_id || owner_connection == UNASSIGNED_CONNECTION {
+                continue;
+            }
+            if range.status.get() != RANGE_STATUS_ACTIVE {
+                continue;
+            }
+            let remaining = range.end.get().saturating_sub(range.cursor.get());
+            if remaining < effective_limit {
+                continue;
+            }
+            let speed = range.recent_speed_bps.get();
+            if speed > 0 {
+                active_speeds.push(speed);
+            }
+        }
+
+        let median_speed = median_u64(&mut active_speeds);
+        let mut best_straggler = None::<(usize, u64)>;
         let total = self.dl_ranges.len();
         for offset in 0..total {
             let idx = (self.borrow_cursor + offset) % total;
-            let active = self.dl_ranges[idx].clone();
+            let active = &self.dl_ranges[idx];
             let owner_connection = active.assigned_to.get();
             if owner_connection == connection_id || owner_connection == UNASSIGNED_CONNECTION {
                 continue;
             }
-
-            let start = active.cursor.get();
-            let end = active.end.get();
-            let remaining = end.saturating_sub(start);
-            if remaining <= self.borrow_limit_bytes.saturating_mul(2) {
+            if active.status.get() != RANGE_STATUS_ACTIVE {
+                continue;
+            }
+            let remaining = active.end.get().saturating_sub(active.cursor.get());
+            if remaining <= effective_limit.saturating_mul(2) {
                 continue;
             }
 
-            let steal_size = (((remaining as u128) * (GOLDEN_RATIO_NUM as u128))
-                / (GOLDEN_RATIO_DEN as u128)) as u64;
-            let aligned_split = align_down(end.saturating_sub(steal_size), MB);
-            if aligned_split <= start + self.borrow_limit_bytes {
+            let speed = active.recent_speed_bps.get();
+            if median_speed > 0
+                && speed > 0
+                && speed.saturating_mul(100) <= median_speed.saturating_mul(60)
+                && remaining >= effective_limit.saturating_mul(3)
+            {
+                match best_straggler {
+                    Some((_, best_remaining)) if best_remaining >= remaining => {}
+                    _ => best_straggler = Some((idx, remaining)),
+                }
+            }
+        }
+
+        if let Some((idx, _)) = best_straggler {
+            return Some((idx, BorrowKind::Straggler));
+        }
+
+        for offset in 0..total {
+            let idx = (self.borrow_cursor + offset) % total;
+            let active = &self.dl_ranges[idx];
+            let owner_connection = active.assigned_to.get();
+            if owner_connection == connection_id || owner_connection == UNASSIGNED_CONNECTION {
                 continue;
             }
-
-            let stolen_size = end.saturating_sub(aligned_split);
-            if stolen_size < self.borrow_limit_bytes {
+            if active.status.get() != RANGE_STATUS_ACTIVE {
                 continue;
             }
-
-            active.end.set(aligned_split);
-
-            let borrowed = Rc::new(ActiveRange {
-                id: self.next_range_id,
-                label_start_mb: active.label_start_mb,
-                label_end_mb: active.label_end_mb,
-                byte_start: aligned_split,
-                assigned_to: Cell::new(connection_id),
-                cursor: Cell::new(aligned_split),
-                end: Cell::new(end),
-                parent_range_id: Some(active.id),
-                status: Cell::new(RANGE_STATUS_ACTIVE),
-            });
-            self.next_range_id += 1;
-            SchedulerMetrics::add(&self.metrics.borrow_assignments, 1);
-            SchedulerMetrics::add(&self.metrics.bytes_borrowed, stolen_size);
-            let donor_id = active.id;
-            let donor_label_start = active.label_start_mb;
-            let donor_label_end = active.label_end_mb;
-            self.dl_ranges.push(borrowed.clone());
-            self.borrow_cursor = idx + 1;
-
-            self.log(&format!(
-                "borrow conn={} from_conn={} donor_range#{} new_range#{} support={}..{}MB bytes={}..{}",
-                connection_id,
-                owner_connection,
-                donor_id,
-                borrowed.id,
-                donor_label_start,
-                donor_label_end,
-                aligned_split,
-                end
-            ));
-            return Some(borrowed);
+            let remaining = active.end.get().saturating_sub(active.cursor.get());
+            if remaining <= effective_limit.saturating_mul(2) {
+                continue;
+            }
+            let kind = if self.is_tail_phase() {
+                BorrowKind::Tail
+            } else {
+                BorrowKind::Standard
+            };
+            return Some((idx, kind));
         }
 
         None
+    }
+
+    fn split_active_range(
+        &mut self,
+        idx: usize,
+        connection_id: u32,
+        kind: BorrowKind,
+    ) -> Option<Rc<ActiveRange>> {
+        let active = self.dl_ranges[idx].clone();
+        let owner_connection = active.assigned_to.get();
+        let start = active.cursor.get();
+        let end = active.end.get();
+        let effective_limit = self.effective_borrow_limit_bytes();
+        let remaining = end.saturating_sub(start);
+        if remaining <= effective_limit.saturating_mul(2) {
+            return None;
+        }
+
+        let steal_size = match kind {
+            BorrowKind::Straggler => remaining / 2,
+            BorrowKind::Tail => remaining / 2,
+            BorrowKind::Standard => (((remaining as u128) * (GOLDEN_RATIO_NUM as u128))
+                / (GOLDEN_RATIO_DEN as u128)) as u64,
+        };
+        let aligned_split = align_down(end.saturating_sub(steal_size), MB);
+        if aligned_split <= start + effective_limit {
+            return None;
+        }
+
+        let stolen_size = end.saturating_sub(aligned_split);
+        if stolen_size < effective_limit {
+            return None;
+        }
+
+        active.end.set(aligned_split);
+
+        let borrowed = Rc::new(ActiveRange {
+            id: self.next_range_id,
+            label_start_mb: active.label_start_mb,
+            label_end_mb: active.label_end_mb,
+            byte_start: aligned_split,
+            assigned_to: Cell::new(connection_id),
+            cursor: Cell::new(aligned_split),
+            end: Cell::new(end),
+            parent_range_id: Some(active.id),
+            status: Cell::new(RANGE_STATUS_ACTIVE),
+            last_sample_cursor: Cell::new(aligned_split),
+            last_sample_at_ms: Cell::new(0),
+            recent_speed_bps: Cell::new(0),
+        });
+        self.next_range_id += 1;
+        SchedulerMetrics::add(&self.metrics.borrow_assignments, 1);
+        SchedulerMetrics::add(&self.metrics.bytes_borrowed, stolen_size);
+        if kind == BorrowKind::Straggler {
+            SchedulerMetrics::add(&self.metrics.straggler_splits, 1);
+        }
+        if kind == BorrowKind::Tail {
+            SchedulerMetrics::add(&self.metrics.tail_splits, 1);
+        }
+        let donor_id = active.id;
+        let donor_label_start = active.label_start_mb;
+        let donor_label_end = active.label_end_mb;
+        let donor_speed = active.recent_speed_bps.get();
+        self.dl_ranges.push(borrowed.clone());
+        self.borrow_cursor = idx + 1;
+
+        self.log(&format!(
+            "borrow kind={} conn={} from_conn={} donor_range#{} new_range#{} support={}..{}MB bytes={}..{} donor_speed_Bps={}",
+            kind.as_str(),
+            connection_id,
+            owner_connection,
+            donor_id,
+            borrowed.id,
+            donor_label_start,
+            donor_label_end,
+            aligned_split,
+            end,
+            donor_speed,
+        ));
+        Some(borrowed)
+    }
+
+    fn effective_borrow_limit_bytes(&self) -> u64 {
+        if self.is_tail_phase() {
+            self.borrow_limit_bytes.min(MB).max(MB)
+        } else {
+            self.borrow_limit_bytes
+        }
+    }
+
+    fn is_tail_phase(&self) -> bool {
+        if self.total_size == 0 {
+            return false;
+        }
+        let completed = snapshot_downloaded(self, self.total_size);
+        completed.saturating_mul(100) >= self.total_size.saturating_mul(95)
     }
 
     fn snapshot(&self) -> CoordinatorSnapshot {
@@ -962,7 +1191,7 @@ struct ConnectionWorker {
     dry_run: bool,
     borrow_limit_bytes: u64,
     metrics: Rc<SchedulerMetrics>,
-    client: reqwest::Client,
+    client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
 }
 
@@ -976,7 +1205,62 @@ struct AttemptTiming {
     chunks: u64,
 }
 
+#[derive(Debug, Default)]
+struct PendingWrite {
+    start_offset: u64,
+    data: Vec<u8>,
+}
+
 impl ConnectionWorker {
+    async fn flush_pending_write(
+        &self,
+        file: &mut tokio::fs::File,
+        pending: &mut PendingWrite,
+        attempt_timing: &mut AttemptTiming,
+    ) -> Result<()> {
+        if pending.data.is_empty() {
+            return Ok(());
+        }
+
+        let write_started = Instant::now();
+        file.seek(SeekFrom::Start(pending.start_offset)).await?;
+        file.write_all(&pending.data).await?;
+        let write_ms = write_started.elapsed().as_millis() as u64;
+        attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
+        SchedulerMetrics::add(&self.metrics.file_write_ms, write_ms);
+        pending.data.clear();
+        Ok(())
+    }
+
+    fn append_pending_write(&self, pending: &mut PendingWrite, offset: u64, data: &[u8]) {
+        if pending.data.is_empty() {
+            pending.start_offset = offset;
+        }
+        pending.data.extend_from_slice(data);
+    }
+
+    fn update_range_speed_sample(&self, range: &Rc<ActiveRange>, current_cursor: u64) {
+        let now_ms = unix_time_ms();
+        let last_at = range.last_sample_at_ms.get();
+        let last_cursor = range.last_sample_cursor.get();
+        if last_at == 0 {
+            range.last_sample_at_ms.set(now_ms);
+            range.last_sample_cursor.set(current_cursor);
+            return;
+        }
+
+        let elapsed_ms = now_ms.saturating_sub(last_at);
+        let advanced = current_cursor.saturating_sub(last_cursor);
+        if elapsed_ms < 250 || advanced == 0 {
+            return;
+        }
+
+        let speed_bps = ((advanced as u128) * 1000 / (elapsed_ms as u128)) as u64;
+        range.recent_speed_bps.set(speed_bps);
+        range.last_sample_at_ms.set(now_ms);
+        range.last_sample_cursor.set(current_cursor);
+    }
+
     async fn log_msg(&self, msg: &str) {
         if let Ok(mut f) = OpenOptions::new()
             .create(true)
@@ -1051,6 +1335,7 @@ impl ConnectionWorker {
             let step = DRY_RUN_STEP_BYTES.min(end - local_cursor);
             let new_pos = local_cursor + step;
             range.cursor.set(new_pos);
+            self.update_range_speed_sample(&range, new_pos);
             self.global_downloaded
                 .set(self.global_downloaded.get().saturating_add(step));
             self.index_state.mark_completed_span(local_cursor, new_pos);
@@ -1088,6 +1373,7 @@ impl ConnectionWorker {
         let mut current_range_id: Option<u64> = None;
         let mut consecutive_failures = 0_u32;
         let mut range_wait_started = Instant::now();
+        let mut pending_write = PendingWrite::default();
 
         loop {
             if self.control.is_halted() {
@@ -1166,11 +1452,13 @@ impl ConnectionWorker {
             let request_started = Instant::now();
             let mut made_progress_this_attempt = false;
             let mut attempt_timing = AttemptTiming::default();
-            let response = match self.client
-                .get(&self.url)
-                .header("Range", format!("bytes={}-{}", start, end - 1))
-                .send()
-                .await
+            let response = match send_request_follow_redirects(
+                &self.client,
+                Method::GET,
+                &self.url,
+                Some((start, end - 1)),
+            )
+            .await
             {
                 Ok(res) => res,
                 Err(e) => {
@@ -1204,21 +1492,29 @@ impl ConnectionWorker {
                 continue;
             }
 
-            let mut stream = response.bytes_stream();
+            let mut stream = response.into_body();
             let mut stream_failed = None::<String>;
             let stream_started = Instant::now();
             let mut first_chunk_at: Option<Instant> = None;
-            while let Some(chunk_result) = stream.next().await {
+            while let Some(frame_result) = stream.frame().await {
                 if self.control.is_halted() {
+                    self
+                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .await?;
                     return Ok(());
                 }
 
-                let chunk = match chunk_result {
-                    Ok(c) => c,
+                let frame = match frame_result {
+                    Ok(frame) => frame,
                     Err(e) => {
                         stream_failed = Some(format!("stream error: {}", e));
                         break;
                     }
+                };
+
+                let chunk = match frame.into_data() {
+                    Ok(chunk) => chunk,
+                    Err(_) => continue,
                 };
 
                 if first_chunk_at.is_none() {
@@ -1229,20 +1525,24 @@ impl ConnectionWorker {
 
                 let max_end = range.end.get();
                 if local_cursor >= max_end {
+                    self
+                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .await?;
                     current_range = None;
                     break;
                 }
 
                 let to_write = (max_end - local_cursor).min(chunk.len() as u64) as usize;
-                let write_started = Instant::now();
-                file.seek(SeekFrom::Start(local_cursor)).await?;
-                file.write_all(&chunk[..to_write]).await?;
-                let write_ms = write_started.elapsed().as_millis() as u64;
-                attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
-                SchedulerMetrics::add(&self.metrics.file_write_ms, write_ms);
+                self.append_pending_write(&mut pending_write, local_cursor, &chunk[..to_write]);
+                if pending_write.data.len() >= WRITE_BUFFER_BYTES {
+                    self
+                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .await?;
+                }
 
                 let new_pos = local_cursor + to_write as u64;
                 range.cursor.set(new_pos);
+                self.update_range_speed_sample(&range, new_pos);
                 self.global_downloaded.set(
                     self.global_downloaded
                         .get()
@@ -1278,6 +1578,9 @@ impl ConnectionWorker {
                 }
 
                 if to_write < chunk.len() {
+                    self
+                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .await?;
                     current_range = None;
                     current_range_id = None;
                     consecutive_failures = 0;
@@ -1290,6 +1593,9 @@ impl ConnectionWorker {
             SchedulerMetrics::add(&self.metrics.http_stream_ms, attempt_timing.stream_ms);
 
             if let Some(reason) = stream_failed {
+                self
+                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .await?;
                 if made_progress_this_attempt {
                     consecutive_failures = 0;
                     self.log_attempt_summary(&range, start, end, &attempt_timing, "reopen", http_version)
@@ -1319,6 +1625,9 @@ impl ConnectionWorker {
                 consecutive_failures = 0;
             }
             if local_cursor >= range.end.get() {
+                self
+                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .await?;
                 range.status.set(RANGE_STATUS_FINISHED);
                 SchedulerMetrics::add(&self.metrics.completed_ranges, 1);
                 self.log_attempt_summary(&range, start, end, &attempt_timing, "complete", http_version)
@@ -1328,11 +1637,20 @@ impl ConnectionWorker {
                 consecutive_failures = 0;
                 range_wait_started = Instant::now();
             } else if made_progress_this_attempt {
+                self
+                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .await?;
                 self.log_attempt_summary(&range, start, end, &attempt_timing, "partial", http_version)
                     .await;
             }
         }
 
+        if !pending_write.data.is_empty() {
+            let mut final_timing = AttemptTiming::default();
+            self
+                .flush_pending_write(&mut file, &mut pending_write, &mut final_timing)
+                .await?;
+        }
         if let Some(handle) = prefetch_handle {
             handle.abort();
         }
@@ -1508,13 +1826,37 @@ fn choose_seed_start_idx(fib_mb: &[u64], support_idx: usize, connections: usize,
         return 0;
     }
 
-    let target_initial_ranges = connections.saturating_add(3);
-    let desired_floor_idx = fib_mb
+    let desired_start = fib_mb
         .iter()
         .position(|value| *value >= LIVE_SEED_FLOOR_MB)
         .unwrap_or(0);
-    let max_start_for_balance = support_idx.saturating_sub(target_initial_ranges);
-    desired_floor_idx.min(max_start_for_balance)
+    let max_start_with_enough_lanes = support_idx.saturating_sub(connections.max(1));
+    desired_start.min(max_start_with_enough_lanes)
+}
+
+fn choose_adaptive_seed_start_idx(
+    fib_mb: &[u64],
+    support_idx: usize,
+    total_size: u64,
+    connections: usize,
+    dry_run: bool,
+) -> usize {
+    if dry_run || support_idx == 0 {
+        return 0;
+    }
+
+    let target_mb = total_size
+        .div_ceil(connections.max(1) as u64)
+        .div_ceil(MB)
+        .max(1);
+    let upper_idx = fib_mb
+        .iter()
+        .position(|value| *value >= target_mb)
+        .unwrap_or(support_idx)
+        .min(support_idx);
+    let desired_start = upper_idx.saturating_sub(2);
+    let max_start_with_enough_lanes = support_idx.saturating_sub(connections.max(1));
+    desired_start.min(max_start_with_enough_lanes)
 }
 
 fn build_seed_ranges(
@@ -1557,6 +1899,58 @@ fn build_seed_ranges(
     ranges
 }
 
+fn build_equal_ranges(total_size: u64, connections: usize) -> Vec<RangeSpec> {
+    if total_size == 0 || connections == 0 {
+        return Vec::new();
+    }
+
+    let lanes = connections.min(total_size.div_ceil(MB) as usize).max(1);
+    let mut ranges = Vec::with_capacity(lanes);
+    let mut start = 0_u64;
+
+    for idx in 0..lanes {
+        let remaining_bytes = total_size.saturating_sub(start);
+        let remaining_lanes = (lanes - idx) as u64;
+        let chunk_size = remaining_bytes.div_ceil(remaining_lanes);
+        let end = if idx + 1 == lanes {
+            total_size
+        } else {
+            (start + chunk_size).min(total_size)
+        };
+
+        if end <= start {
+            continue;
+        }
+
+        ranges.push(RangeSpec {
+            id: ranges.len() as u64,
+            label_start_mb: bytes_to_floor_mb(start),
+            label_end_mb: bytes_to_ceiling_mb(end),
+            byte_start: start,
+            byte_end: end,
+        });
+        start = end;
+    }
+
+    ranges
+}
+
+fn build_initial_ranges(
+    fib_mb: &[u64],
+    seed_start_idx: usize,
+    support_idx: usize,
+    total_size: u64,
+    connections: usize,
+    schedule_mode: ScheduleMode,
+) -> Vec<RangeSpec> {
+    match schedule_mode {
+        ScheduleMode::Fib | ScheduleMode::FibAdaptive => {
+            build_seed_ranges(fib_mb, seed_start_idx, support_idx, total_size)
+        }
+        ScheduleMode::Equal => build_equal_ranges(total_size, connections),
+    }
+}
+
 fn estimate_speed_bps(started_at: Instant, start_offset: u64, current_offset: u64) -> f64 {
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed <= 0.0 {
@@ -1569,6 +1963,21 @@ fn should_prefetch(remaining_bytes: u64, recent_speed_bps: f64, borrow_limit_byt
     let handshake_bytes = ((recent_speed_bps * (LIVE_PREFETCH_HANDSHAKE_MS as f64 / 1000.0)).ceil())
         .max((LIVE_PREFETCH_MIN_MB * MB) as f64) as u64;
     remaining_bytes <= handshake_bytes.max(borrow_limit_bytes)
+}
+
+fn median_u64(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn retry_delay_ms(attempt: u32) -> u64 {
@@ -1596,15 +2005,84 @@ fn valid_slice_mask(total_size: u64, bucket_idx: usize) -> u8 {
     }
 }
 
-fn http_version_label(version: reqwest::Version) -> &'static str {
+fn http_version_label(version: Version) -> &'static str {
     match version {
-        reqwest::Version::HTTP_09 => "HTTP/0.9",
-        reqwest::Version::HTTP_10 => "HTTP/1.0",
-        reqwest::Version::HTTP_11 => "HTTP/1.1",
-        reqwest::Version::HTTP_2 => "HTTP/2",
-        reqwest::Version::HTTP_3 => "HTTP/3",
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
         _ => "HTTP/?",
     }
+}
+
+fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let https = match http_mode {
+        HttpMode::Auto => HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http),
+        HttpMode::Http1 => HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http),
+        HttpMode::Http2 => HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http2()
+            .wrap_connector(http),
+    };
+
+    HyperClient::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build(https)
+}
+
+async fn send_request_follow_redirects(
+    client: &DownloadHttpClient,
+    method: Method,
+    url: &str,
+    range: Option<(u64, u64)>,
+) -> Result<hyper::Response<Incoming>> {
+    let mut current_url = url.to_owned();
+
+    for _ in 0..=MAX_REDIRECTS {
+        let uri: Uri = current_url.parse()?;
+        let mut builder = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(ACCEPT, "*/*");
+        if let Some((start, end)) = range {
+            builder = builder.header(RANGE, format!("bytes={}-{}", start, end));
+        }
+        let request = builder.body(Empty::<Bytes>::new())?;
+        let response: hyper::Response<Incoming> = client.request(request).await?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value: &http::HeaderValue| value.to_str().ok())
+                .ok_or_else(|| anyhow!("redirect missing location header"))?;
+            current_url = resolve_redirect_url(&current_url, location)?;
+            continue;
+        }
+
+        return Ok(response);
+    }
+
+    Err(anyhow!("too many redirects for {}", url))
+}
+
+fn resolve_redirect_url(base: &str, location: &str) -> Result<String> {
+    let base = Url::parse(base)?;
+    Ok(base.join(location)?.to_string())
 }
 
 fn align_down(value: u64, alignment: u64) -> u64 {
@@ -1645,6 +2123,10 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 fn bytes_to_ceiling_mb(bytes: u64) -> u64 {
     bytes.div_ceil(MB)
+}
+
+fn bytes_to_floor_mb(bytes: u64) -> u64 {
+    bytes / MB
 }
 
 fn persist_snapshot(path: &Path, snapshot: &TaskSnapshot) -> Result<()> {

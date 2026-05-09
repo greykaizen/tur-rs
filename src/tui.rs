@@ -14,7 +14,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
 };
 use tokio::sync::mpsc;
-use crate::engine::{DownloadTask, DownloadStatus, EngineEvent, EngineCommand};
+use crate::engine::{DownloadTask, DownloadStatus, EngineEvent, EngineCommand, HttpMode, ScheduleMode};
 use uuid::Uuid;
 use std::path::PathBuf;
 
@@ -36,6 +36,8 @@ pub struct TuiApp {
     dry_run: bool,
     dry_run_size_mb: Option<u64>,
     borrow_limit_mb: u64,
+    schedule_mode: ScheduleMode,
+    http_mode: HttpMode,
     log_root: Option<PathBuf>,
 }
 
@@ -46,6 +48,8 @@ impl TuiApp {
         dry_run: bool,
         dry_run_size_mb: Option<u64>,
         borrow_limit_mb: u64,
+        schedule_mode: ScheduleMode,
+        http_mode: HttpMode,
         log_root: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -59,6 +63,8 @@ impl TuiApp {
             dry_run,
             dry_run_size_mb,
             borrow_limit_mb,
+            schedule_mode,
+            http_mode,
             log_root,
         }
     }
@@ -78,6 +84,8 @@ impl TuiApp {
             dry_run: self.dry_run,
             dry_run_size_mb: self.dry_run_size_mb,
             borrow_limit_mb: self.borrow_limit_mb,
+            schedule_mode: self.schedule_mode,
+            http_mode: self.http_mode,
             log_root: self.log_root.clone(),
         };
         self.tasks.push(task.clone());
