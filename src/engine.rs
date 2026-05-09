@@ -805,24 +805,16 @@ impl Coordinator {
             .position(|value| *value >= ceil_mb.max(1))
             .ok_or_else(|| anyhow!("Download exceeds generated Fibonacci range table"))?;
 
-        let seed_start_idx = match schedule_mode {
-            ScheduleMode::FibAdaptive => choose_adaptive_seed_start_idx(
-                &fib_mb,
-                support_idx,
-                total_size,
-                connections.max(1),
-                dry_run,
-            ),
-            _ => choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run),
+        let seed_ranges = match schedule_mode {
+            ScheduleMode::FibAdaptive => {
+                build_phi_geometric_ranges(total_size, connections.max(1), 1.5, 4194304)
+            }
+            ScheduleMode::Fib => {
+                let seed_start_idx = choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
+                build_seed_ranges(&fib_mb, seed_start_idx, support_idx, total_size)
+            }
+            ScheduleMode::Equal => build_equal_ranges(total_size, connections.max(1)),
         };
-        let seed_ranges = build_initial_ranges(
-            &fib_mb,
-            seed_start_idx,
-            support_idx,
-            total_size,
-            connections.max(1),
-            schedule_mode,
-        );
         let dl_ranges: Vec<Rc<ActiveRange>> = seed_ranges
             .iter()
             .map(|spec| {
@@ -862,7 +854,7 @@ impl Coordinator {
             ceil_mb,
             schedule_mode.as_str(),
             if dry_run { 1 } else { LIVE_SEED_FLOOR_MB },
-            fib_mb[seed_start_idx],
+            seed_ranges.first().map(|r| r.label_start_mb).unwrap_or(0),
             fib_mb[support_idx],
             borrow_limit_mb.max(1),
             dry_run,
@@ -1302,7 +1294,8 @@ impl ConnectionWorker {
 
     async fn flush_pending_write(
         &self,
-        file: &mut storage::DownloadFile,
+        write_tx: &tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
+        recycle_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
         pending: &mut PendingWrite,
         attempt_timing: &mut AttemptTiming,
     ) -> Result<()> {
@@ -1311,11 +1304,20 @@ impl ConnectionWorker {
         }
 
         let write_started = Instant::now();
-        file.write_all_at(pending.start_offset, &pending.data).await?;
+        let data_to_write = std::mem::take(&mut pending.data);
+        write_tx.send((pending.start_offset, data_to_write)).await
+            .map_err(|_| anyhow::anyhow!("writer task died"))?;
+            
+        if let Ok(mut recycled) = recycle_rx.try_recv() {
+            recycled.clear();
+            pending.data = recycled;
+        } else {
+            pending.data = Vec::with_capacity(pending.target_bytes.max(WRITE_BUFFER_MIN_BYTES));
+        }
+
         let write_ms = write_started.elapsed().as_millis() as u64;
         attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
-        SchedulerMetrics::add(&self.metrics.file_write_ms, write_ms);
-        pending.data.clear();
+        
         self.trim_pending_write(pending);
         Ok(())
     }
@@ -1497,8 +1499,26 @@ impl ConnectionWorker {
         let mut file = storage::open_download_file_for_write(&self.file_path).await?;
         let file_backend = file.backend();
         let open_file_ms = file_open_started.elapsed().as_millis() as u64;
-        SchedulerMetrics::add(&self.metrics.startup_workers, 1);
+
         SchedulerMetrics::add(&self.metrics.startup_open_file_ms, open_file_ms);
+
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(2);
+        let (recycle_tx, mut recycle_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let metrics_clone = std::rc::Rc::clone(&self.metrics);
+        let writer_handle = tokio::task::spawn_local(async move {
+            while let Some((offset, mut data)) = write_rx.recv().await {
+                let write_started = Instant::now();
+                if let Err(e) = file.write_all_at(offset, &data).await {
+                    return Err(e);
+                }
+                let write_ms = write_started.elapsed().as_millis() as u64;
+                SchedulerMetrics::add(&metrics_clone.file_write_ms, write_ms);
+                
+                data.clear();
+                let _ = recycle_tx.send(data);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
         let mut startup = StartupProbe {
             worker_started_at,
             open_file_ms,
@@ -1651,7 +1671,7 @@ impl ConnectionWorker {
             while let Some(frame_result) = stream.frame().await {
                 if self.control.is_halted() {
                     self
-                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                         .await?;
                     return Ok(());
                 }
@@ -1692,7 +1712,7 @@ impl ConnectionWorker {
                 let max_end = range.end.get();
                 if local_cursor >= max_end {
                     self
-                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                         .await?;
                     current_range = None;
                     break;
@@ -1718,7 +1738,7 @@ impl ConnectionWorker {
                 self.update_pending_write_target(&mut pending_write, recent_speed_bps);
                 if pending_write.data.len() >= pending_write.target_bytes {
                     self
-                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                         .await?;
                 }
 
@@ -1746,7 +1766,7 @@ impl ConnectionWorker {
 
                 if to_write < chunk.len() {
                     self
-                        .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                         .await?;
                     current_range = None;
                     current_range_id = None;
@@ -1762,7 +1782,7 @@ impl ConnectionWorker {
 
             if let Some(reason) = stream_failed {
                 self
-                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                     .await?;
                 if made_progress_this_attempt {
                     consecutive_failures = 0;
@@ -1795,7 +1815,7 @@ impl ConnectionWorker {
             }
             if local_cursor >= range.end.get() {
                 self
-                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                     .await?;
                 range.status.set(RANGE_STATUS_FINISHED);
                 SchedulerMetrics::add(&self.metrics.completed_ranges, 1);
@@ -1808,7 +1828,7 @@ impl ConnectionWorker {
                 self.reset_pending_write_target(&mut pending_write);
             } else if made_progress_this_attempt {
                 self
-                    .flush_pending_write(&mut file, &mut pending_write, &mut attempt_timing)
+                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                     .await?;
                 self.log_attempt_summary(&range, start, end, &attempt_timing, "partial", http_version)
                     .await;
@@ -1819,11 +1839,16 @@ impl ConnectionWorker {
         if !pending_write.data.is_empty() {
             let mut final_timing = AttemptTiming::default();
             self
-                .flush_pending_write(&mut file, &mut pending_write, &mut final_timing)
+                .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut final_timing)
                 .await?;
         }
         if let Some(handle) = prefetch_handle {
             handle.abort();
+        }
+        drop(write_tx);
+        if let Err(e) = writer_handle.await.unwrap_or(Ok(())) {
+            self.log_msg(&format!("Writer task failed: {}", e)).await;
+            return Err(e);
         }
         Ok(())
     }
@@ -2005,31 +2030,6 @@ fn choose_seed_start_idx(fib_mb: &[u64], support_idx: usize, connections: usize,
     desired_start.min(max_start_with_enough_lanes)
 }
 
-fn choose_adaptive_seed_start_idx(
-    fib_mb: &[u64],
-    support_idx: usize,
-    total_size: u64,
-    connections: usize,
-    dry_run: bool,
-) -> usize {
-    if dry_run || support_idx == 0 {
-        return 0;
-    }
-
-    let target_mb = total_size
-        .div_ceil(connections.max(1) as u64)
-        .div_ceil(MB)
-        .max(1);
-    let upper_idx = fib_mb
-        .iter()
-        .position(|value| *value >= target_mb)
-        .unwrap_or(support_idx)
-        .min(support_idx);
-    let desired_start = upper_idx.saturating_sub(2);
-    let max_start_with_enough_lanes = support_idx.saturating_sub(connections.max(1));
-    desired_start.min(max_start_with_enough_lanes)
-}
-
 fn build_seed_ranges(
     fib_mb: &[u64],
     seed_start_idx: usize,
@@ -2106,20 +2106,68 @@ fn build_equal_ranges(total_size: u64, connections: usize) -> Vec<RangeSpec> {
     ranges
 }
 
-fn build_initial_ranges(
-    fib_mb: &[u64],
-    seed_start_idx: usize,
-    support_idx: usize,
-    total_size: u64,
-    connections: usize,
-    schedule_mode: ScheduleMode,
+fn build_phi_geometric_ranges(
+    file_size: u64,
+    n: usize,
+    max_ratio: f64,
+    block_size: u64,
 ) -> Vec<RangeSpec> {
-    match schedule_mode {
-        ScheduleMode::Fib | ScheduleMode::FibAdaptive => {
-            build_seed_ranges(fib_mb, seed_start_idx, support_idx, total_size)
-        }
-        ScheduleMode::Equal => build_equal_ranges(total_size, connections),
+    if file_size == 0 || n == 0 {
+        return Vec::new();
     }
+    if n == 1 {
+        return vec![RangeSpec {
+            id: 0,
+            label_start_mb: bytes_to_floor_mb(0),
+            label_end_mb: bytes_to_ceiling_mb(file_size),
+            byte_start: 0,
+            byte_end: file_size,
+        }];
+    }
+
+    let phi: f64 = 1.6180339887498948482;
+    let alpha = max_ratio.ln() / ((n - 1) as f64 * phi.ln());
+
+    let mut weights = Vec::with_capacity(n);
+    let mut w_sum = 0.0;
+    for i in 0..n {
+        let w = phi.powf(alpha * (i as f64));
+        weights.push(w);
+        w_sum += w;
+    }
+
+    let mut boundaries = Vec::with_capacity(n + 1);
+    boundaries.push(0_u64);
+
+    let mut cumsum = 0.0;
+    for i in 0..n - 1 {
+        cumsum += file_size as f64 * weights[i] / w_sum;
+        let mut boundary = (cumsum / block_size as f64).round() as u64 * block_size;
+        boundary = boundary.clamp(boundaries[i], file_size);
+        boundaries.push(boundary);
+    }
+    boundaries.push(file_size);
+
+    if boundaries[1] - boundaries[0] < block_size {
+        return build_equal_ranges(file_size, n);
+    }
+
+    let mut ranges = Vec::with_capacity(n);
+    for i in 0..n {
+        let byte_start = boundaries[i];
+        let byte_end = boundaries[i + 1];
+        if byte_end > byte_start {
+            ranges.push(RangeSpec {
+                id: i as u64,
+                label_start_mb: bytes_to_floor_mb(byte_start),
+                label_end_mb: bytes_to_ceiling_mb(byte_end),
+                byte_start,
+                byte_end,
+            });
+        }
+    }
+
+    ranges
 }
 
 fn estimate_speed_bps(started_at: Instant, start_offset: u64, current_offset: u64) -> f64 {
