@@ -277,6 +277,7 @@ mod platform {
 
     #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
     async fn open_download_file_for_write_linux_uring(path: &Path) -> Result<DownloadFile> {
+        use rustix::fs::OFlags;
         use std::os::unix::fs::OpenOptionsExt;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<LinuxIoUringCommand>();
@@ -288,7 +289,7 @@ mod platform {
                 tokio_uring::start(async move {
                     let mut options = tokio_uring::fs::OpenOptions::new();
                     options.write(true);
-                    options.custom_flags(libc::O_DIRECT);
+                    options.custom_flags(OFlags::DIRECT.bits() as i32);
                     let file = match options.open(&path).await {
                         Ok(file) => file,
                         Err(_) => return,
