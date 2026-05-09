@@ -20,7 +20,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 use url::Url;
@@ -1240,7 +1240,7 @@ struct PendingWrite {
 impl ConnectionWorker {
     async fn flush_pending_write(
         &self,
-        file: &mut tokio::fs::File,
+        file: &mut storage::DownloadFile,
         pending: &mut PendingWrite,
         attempt_timing: &mut AttemptTiming,
     ) -> Result<()> {
@@ -1249,8 +1249,7 @@ impl ConnectionWorker {
         }
 
         let write_started = Instant::now();
-        file.seek(SeekFrom::Start(pending.start_offset)).await?;
-        file.write_all(&pending.data).await?;
+        file.write_all_at(pending.start_offset, &pending.data).await?;
         let write_ms = write_started.elapsed().as_millis() as u64;
         attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
         SchedulerMetrics::add(&self.metrics.file_write_ms, write_ms);

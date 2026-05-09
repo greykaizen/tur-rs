@@ -3,6 +3,10 @@ name = "tur"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+default = []
+linux-io-uring-experimental = []
+
 [dependencies]
 anyhow = "1.0.102"
 bincode = "1.3.3"
