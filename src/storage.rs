@@ -2,7 +2,14 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use anyhow::Result;
-use tokio::fs::{File, OpenOptions};
+#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+use anyhow::anyhow;
+use tokio::fs::File;
+#[cfg(not(all(target_os = "linux", feature = "linux-io-uring-experimental")))]
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+use tokio::sync::{mpsc, oneshot};
 
 pub fn prepare_download_file(path: &Path, total_size: u64) -> Result<()> {
     let file = std::fs::File::create(path)?;
@@ -20,8 +27,17 @@ pub enum StorageBackendKind {
     WindowsPlanned,
 }
 
+enum DownloadFileInner {
+    #[cfg_attr(all(target_os = "linux", feature = "linux-io-uring-experimental"), allow(dead_code))]
+    Tokio(File),
+    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    LinuxIoUring {
+        tx: mpsc::UnboundedSender<LinuxIoUringCommand>,
+    },
+}
+
 pub struct DownloadFile {
-    inner: File,
+    inner: DownloadFileInner,
     backend: StorageBackendKind,
 }
 
@@ -38,14 +54,37 @@ impl DownloadFile {
     }
 
     pub async fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        platform::write_all_at(&mut self.inner, offset, data).await
+        match &mut self.inner {
+            DownloadFileInner::Tokio(file) => platform::write_all_at_tokio(file, offset, data).await,
+            #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+            DownloadFileInner::LinuxIoUring { tx } => {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                tx.send(LinuxIoUringCommand::WriteAllAt {
+                    offset,
+                    data: data.to_vec(),
+                    resp: resp_tx,
+                })
+                .map_err(|_| anyhow!("io_uring backend thread is not available"))?;
+                resp_rx
+                    .await
+                    .map_err(|_| anyhow!("io_uring backend response channel closed"))??;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for DownloadFile {
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+        if let DownloadFileInner::LinuxIoUring { tx } = &self.inner {
+            let _ = tx.send(LinuxIoUringCommand::Shutdown);
+        }
     }
 }
 
 pub async fn open_download_file_for_write(path: &Path) -> Result<DownloadFile> {
-    let file = OpenOptions::new().write(true).open(path).await?;
-    let backend = platform::configure_write_file(&file)?;
-    Ok(DownloadFile { inner: file, backend })
+    platform::open_download_file_for_write(path).await
 }
 
 #[derive(Debug)]
@@ -102,131 +141,122 @@ impl Drop for AlignedBuffer {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod platform {
-    use anyhow::Result;
-    use tokio::fs::File;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+enum LinuxIoUringCommand {
+    WriteAllAt {
+        offset: u64,
+        data: Vec<u8>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    Shutdown,
+}
 
-    use crate::storage::StorageBackendKind;
+mod platform {
+    use super::*;
 
     pub const DIRECT_IO_ALIGNMENT: usize = 4096;
-    #[cfg(feature = "linux-io-uring-experimental")]
+    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    #[allow(dead_code)]
     pub const DIRECT_IO_BLOCK_BYTES: usize = 4096;
 
     pub fn prepare_download_file(file: &std::fs::File, total_size: u64) -> Result<()> {
         let _ = (file, total_size);
-        // TODO(io/linux): Add O_DIRECT-aware preallocation once the Linux storage path
-        // moves behind a dedicated io_uring/direct-I/O implementation.
+        #[cfg(target_os = "linux")]
+        {
+            // TODO(io/linux): Add O_DIRECT-aware preallocation once the Linux storage path
+            // moves behind a dedicated io_uring/direct-I/O implementation.
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // TODO(io/macos): Apply Darwin-specific preallocation and document whether the
+            // target volume benefits from sparse vs eager allocation for large files.
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // TODO(io/windows): Investigate SetFileValidData and the required privileges before
+            // using it. We should not enable it by default without a safe capability check.
+        }
         Ok(())
     }
 
-    pub fn configure_write_file(file: &File) -> Result<StorageBackendKind> {
-        let _ = file;
-        #[cfg(feature = "linux-io-uring-experimental")]
+    pub async fn open_download_file_for_write(path: &Path) -> Result<DownloadFile> {
+        #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
         {
-            let _ = (DIRECT_IO_ALIGNMENT, DIRECT_IO_BLOCK_BYTES);
-            // TODO(io/linux): Replace this placeholder with a real io_uring-backed writer.
-            // The backend contract is now explicit:
-            // - aligned buffers at `DIRECT_IO_ALIGNMENT`
-            // - direct-I/O-sized writes in `DIRECT_IO_BLOCK_BYTES` chunks
-            // - fallback to buffered Tokio writes when ranges end with a short tail
-            return Ok(StorageBackendKind::LinuxIoUringExperimental);
+            return open_download_file_for_write_linux_uring(path).await;
         }
 
-        #[cfg(not(feature = "linux-io-uring-experimental"))]
+        #[cfg(not(all(target_os = "linux", feature = "linux-io-uring-experimental")))]
         {
-            // Current stable Linux path: Tokio file writes behind the storage seam.
-            Ok(StorageBackendKind::LinuxTokio)
+            let file = OpenOptions::new().write(true).open(path).await?;
+            let backend = detect_backend_kind();
+            Ok(DownloadFile {
+                inner: DownloadFileInner::Tokio(file),
+                backend,
+            })
         }
     }
 
-    pub async fn write_all_at(file: &mut File, offset: u64, data: &[u8]) -> Result<()> {
+    #[cfg_attr(all(target_os = "linux", feature = "linux-io-uring-experimental"), allow(dead_code))]
+    fn detect_backend_kind() -> StorageBackendKind {
+        #[cfg(target_os = "linux")]
+        {
+            return StorageBackendKind::LinuxTokio;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return StorageBackendKind::MacosPlanned;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return StorageBackendKind::WindowsPlanned;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            return StorageBackendKind::Standard;
+        }
+    }
+
+    pub async fn write_all_at_tokio(file: &mut File, offset: u64, data: &[u8]) -> Result<()> {
         file.seek(SeekFrom::Start(offset)).await?;
         file.write_all(data).await?;
         Ok(())
     }
-}
 
-#[cfg(target_os = "macos")]
-mod platform {
-    use anyhow::Result;
-    use tokio::fs::File;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    async fn open_download_file_for_write_linux_uring(path: &Path) -> Result<DownloadFile> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<LinuxIoUringCommand>();
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("tur-io-uring".to_string())
+            .spawn(move || {
+                tokio_uring::start(async move {
+                    let mut options = tokio_uring::fs::OpenOptions::new();
+                    options.write(true);
+                    let file = match options.open(&path).await {
+                        Ok(file) => file,
+                        Err(_) => return,
+                    };
 
-    use crate::storage::StorageBackendKind;
+                    let file = file;
+                    while let Some(cmd) = rx.recv().await {
+                        match cmd {
+                            LinuxIoUringCommand::WriteAllAt { offset, data, resp } => {
+                                let (result, _) = file.write_all_at(data, offset).await;
+                                let _ = resp.send(result.map_err(anyhow::Error::from));
+                            }
+                            LinuxIoUringCommand::Shutdown => {
+                                let _ = file.close().await;
+                                break;
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|err| anyhow!("failed to spawn io_uring backend thread: {}", err))?;
 
-    pub fn prepare_download_file(file: &std::fs::File, total_size: u64) -> Result<()> {
-        let _ = (file, total_size);
-        // TODO(io/macos): Apply Darwin-specific preallocation and document whether the
-        // target volume benefits from sparse vs eager allocation for large files.
-        Ok(())
-    }
-
-    pub fn configure_write_file(file: &File) -> Result<StorageBackendKind> {
-        let _ = file;
-        // TODO(io/macos): Evaluate F_NOCACHE on the raw descriptor for large downloads.
-        // This should stay opt-in until we verify it helps without harming small files.
-        Ok(StorageBackendKind::MacosPlanned)
-    }
-
-    pub async fn write_all_at(file: &mut File, offset: u64, data: &[u8]) -> Result<()> {
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(data).await?;
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod platform {
-    use anyhow::Result;
-    use tokio::fs::File;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-
-    use crate::storage::StorageBackendKind;
-
-    pub fn prepare_download_file(file: &std::fs::File, total_size: u64) -> Result<()> {
-        let _ = (file, total_size);
-        // TODO(io/windows): Investigate SetFileValidData and the required privileges before
-        // using it. We should not enable it by default without a safe capability check.
-        Ok(())
-    }
-
-    pub fn configure_write_file(file: &File) -> Result<StorageBackendKind> {
-        let _ = file;
-        // TODO(io/windows): Evaluate FILE_FLAG_NO_BUFFERING / FILE_FLAG_OVERLAPPED via a
-        // Windows-specific storage backend. This will also need aligned buffers.
-        Ok(StorageBackendKind::WindowsPlanned)
-    }
-
-    pub async fn write_all_at(file: &mut File, offset: u64, data: &[u8]) -> Result<()> {
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(data).await?;
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod platform {
-    use anyhow::Result;
-    use tokio::fs::File;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-
-    use crate::storage::StorageBackendKind;
-
-    pub fn prepare_download_file(file: &std::fs::File, total_size: u64) -> Result<()> {
-        let _ = (file, total_size);
-        Ok(())
-    }
-
-    pub fn configure_write_file(file: &File) -> Result<StorageBackendKind> {
-        let _ = file;
-        Ok(StorageBackendKind::Standard)
-    }
-
-    pub async fn write_all_at(file: &mut File, offset: u64, data: &[u8]) -> Result<()> {
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(data).await?;
-        Ok(())
+        Ok(DownloadFile {
+            inner: DownloadFileInner::LinuxIoUring { tx },
+            backend: StorageBackendKind::LinuxIoUringExperimental,
+        })
     }
 }
