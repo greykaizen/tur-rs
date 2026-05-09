@@ -23,8 +23,8 @@ pub enum StorageBackendKind {
     Standard,
     LinuxTokio,
     LinuxIoUringExperimental,
-    MacosPlanned,
-    WindowsPlanned,
+    MacosNoCache,
+    WindowsSequential,
 }
 
 enum DownloadFileInner {
@@ -216,18 +216,16 @@ mod platform {
         let _ = (file, total_size);
         #[cfg(target_os = "linux")]
         {
-            // TODO(io/linux): Add O_DIRECT-aware preallocation once the Linux storage path
-            // moves behind a dedicated io_uring/direct-I/O implementation.
+            // Linux already benefits from explicit sizing before the write path opens.
         }
         #[cfg(target_os = "macos")]
         {
-            // TODO(io/macos): Apply Darwin-specific preallocation and document whether the
-            // target volume benefits from sparse vs eager allocation for large files.
+            // Darwin caching policy is applied on the long-lived write handle when it opens.
         }
         #[cfg(target_os = "windows")]
         {
-            // TODO(io/windows): Investigate SetFileValidData and the required privileges before
-            // using it. We should not enable it by default without a safe capability check.
+            // Windows gets the current stable path by pre-sizing here and using sequential
+            // write hints on the long-lived write handle when it opens.
         }
         Ok(())
     }
@@ -236,6 +234,16 @@ mod platform {
         #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
         {
             return open_download_file_for_write_linux_uring(path).await;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return open_download_file_for_write_macos(path).await;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            return open_download_file_for_write_windows(path).await;
         }
 
         #[cfg(not(all(target_os = "linux", feature = "linux-io-uring-experimental")))]
@@ -257,11 +265,11 @@ mod platform {
         }
         #[cfg(target_os = "macos")]
         {
-            return StorageBackendKind::MacosPlanned;
+            return StorageBackendKind::MacosNoCache;
         }
         #[cfg(target_os = "windows")]
         {
-            return StorageBackendKind::WindowsPlanned;
+            return StorageBackendKind::WindowsSequential;
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -315,6 +323,32 @@ mod platform {
         Ok(DownloadFile {
             inner: DownloadFileInner::LinuxIoUring { tx, fallback },
             backend: StorageBackendKind::LinuxIoUringExperimental,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn open_download_file_for_write_macos(path: &Path) -> Result<DownloadFile> {
+        let std_file = std::fs::OpenOptions::new().write(true).open(path)?;
+        rustix::fs::fcntl_nocache(&std_file, true)?;
+        Ok(DownloadFile {
+            inner: DownloadFileInner::Tokio(File::from_std(std_file)),
+            backend: StorageBackendKind::MacosNoCache,
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn open_download_file_for_write_windows(path: &Path) -> Result<DownloadFile> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(path)
+            .await?;
+        Ok(DownloadFile {
+            inner: DownloadFileInner::Tokio(file),
+            backend: StorageBackendKind::WindowsSequential,
         })
     }
 }

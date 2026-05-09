@@ -238,12 +238,18 @@ struct SchedulerMetrics {
     completed_ranges: Cell<u64>,
     retry_attempts: Cell<u64>,
     retry_wait_ms: Cell<u64>,
+    startup_workers: Cell<u64>,
+    startup_open_file_ms: Cell<u64>,
+    startup_first_assignment_wait_ms: Cell<u64>,
+    startup_first_request_setup_ms: Cell<u64>,
+    startup_first_byte_ms: Cell<u64>,
+    startup_total_to_first_byte_ms: Cell<u64>,
 }
 
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -262,6 +268,12 @@ impl SchedulerMetrics {
             self.completed_ranges.get(),
             self.retry_attempts.get(),
             self.retry_wait_ms.get(),
+            self.startup_workers.get(),
+            self.startup_open_file_ms.get(),
+            self.startup_first_assignment_wait_ms.get(),
+            self.startup_first_request_setup_ms.get(),
+            self.startup_first_byte_ms.get(),
+            self.startup_total_to_first_byte_ms.get(),
         )
     }
 
@@ -1237,7 +1249,57 @@ struct PendingWrite {
     target_bytes: usize,
 }
 
+#[derive(Debug)]
+struct StartupProbe {
+    worker_started_at: Instant,
+    open_file_ms: u64,
+    first_assignment_wait_ms: Option<u64>,
+    first_request_setup_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    total_to_first_byte_ms: Option<u64>,
+    logged: bool,
+}
+
 impl ConnectionWorker {
+    fn note_first_assignment(&self, startup: &mut StartupProbe, wait_started: Instant) {
+        if startup.first_assignment_wait_ms.is_none() {
+            let waited_ms = wait_started.elapsed().as_millis() as u64;
+            startup.first_assignment_wait_ms = Some(waited_ms);
+            SchedulerMetrics::add(&self.metrics.startup_first_assignment_wait_ms, waited_ms);
+        }
+    }
+
+    fn note_first_request_setup(&self, startup: &mut StartupProbe, setup_ms: u64) {
+        if startup.first_request_setup_ms.is_none() {
+            startup.first_request_setup_ms = Some(setup_ms);
+            SchedulerMetrics::add(&self.metrics.startup_first_request_setup_ms, setup_ms);
+        }
+    }
+
+    async fn note_first_byte(
+        &self,
+        startup: &mut StartupProbe,
+        file_backend: storage::StorageBackendKind,
+    ) {
+        if startup.logged {
+            return;
+        }
+
+        let first_byte_ms = startup.first_byte_ms.unwrap_or_default();
+        let total_to_first_byte_ms = startup.total_to_first_byte_ms.unwrap_or_default();
+        self.log_msg(&format!(
+            "startup backend={:?} open_file_ms={} first_assignment_wait_ms={} first_request_setup_ms={} first_byte_ms={} total_to_first_byte_ms={}",
+            file_backend,
+            startup.open_file_ms,
+            startup.first_assignment_wait_ms.unwrap_or_default(),
+            startup.first_request_setup_ms.unwrap_or_default(),
+            first_byte_ms,
+            total_to_first_byte_ms,
+        ))
+        .await;
+        startup.logged = true;
+    }
+
     async fn flush_pending_write(
         &self,
         file: &mut storage::DownloadFile,
@@ -1430,7 +1492,22 @@ impl ConnectionWorker {
     }
 
     async fn run_live(self) -> Result<()> {
+        let worker_started_at = Instant::now();
+        let file_open_started = Instant::now();
         let mut file = storage::open_download_file_for_write(&self.file_path).await?;
+        let file_backend = file.backend();
+        let open_file_ms = file_open_started.elapsed().as_millis() as u64;
+        SchedulerMetrics::add(&self.metrics.startup_workers, 1);
+        SchedulerMetrics::add(&self.metrics.startup_open_file_ms, open_file_ms);
+        let mut startup = StartupProbe {
+            worker_started_at,
+            open_file_ms,
+            first_assignment_wait_ms: None,
+            first_request_setup_ms: None,
+            first_byte_ms: None,
+            total_to_first_byte_ms: None,
+            logged: false,
+        };
         let mut current_range: Option<Rc<ActiveRange>> = None;
         let mut prefetched_range: Option<Rc<ActiveRange>> = None;
         let mut prefetch_handle: Option<JoinHandle<Result<Option<Rc<ActiveRange>>>>> = None;
@@ -1463,6 +1540,7 @@ impl ConnectionWorker {
                 if let Some(range) = prefetched_range.take() {
                     SchedulerMetrics::add(&self.metrics.prefetch_hits, 1);
                     current_range = Some(range.clone());
+                    self.note_first_assignment(&mut startup, range_wait_started);
                     range_started_at = Instant::now();
                     local_cursor = range.cursor.get();
                     range_start_cursor = local_cursor;
@@ -1481,6 +1559,7 @@ impl ConnectionWorker {
                 } else {
                     current_range = self.request_work(false).await?;
                     if let Some(range) = &current_range {
+                        self.note_first_assignment(&mut startup, range_wait_started);
                         range_started_at = Instant::now();
                         local_cursor = range.cursor.get();
                         range_start_cursor = local_cursor;
@@ -1548,6 +1627,7 @@ impl ConnectionWorker {
             };
             attempt_timing.request_setup_ms = request_started.elapsed().as_millis() as u64;
             SchedulerMetrics::add(&self.metrics.http_setup_ms, attempt_timing.request_setup_ms);
+            self.note_first_request_setup(&mut startup, attempt_timing.request_setup_ms);
 
             let http_version = http_version_label(response.version());
 
@@ -1593,6 +1673,20 @@ impl ConnectionWorker {
                     first_chunk_at = Some(Instant::now());
                     attempt_timing.first_byte_ms = stream_started.elapsed().as_millis() as u64;
                     SchedulerMetrics::add(&self.metrics.http_ttfb_ms, attempt_timing.first_byte_ms);
+                    if startup.first_byte_ms.is_none() {
+                        startup.first_byte_ms = Some(attempt_timing.first_byte_ms);
+                        startup.total_to_first_byte_ms =
+                            Some(startup.worker_started_at.elapsed().as_millis() as u64);
+                        SchedulerMetrics::add(
+                            &self.metrics.startup_first_byte_ms,
+                            attempt_timing.first_byte_ms,
+                        );
+                        SchedulerMetrics::add(
+                            &self.metrics.startup_total_to_first_byte_ms,
+                            startup.total_to_first_byte_ms.unwrap_or_default(),
+                        );
+                        self.note_first_byte(&mut startup, file_backend).await;
+                    }
                 }
 
                 let max_end = range.end.get();

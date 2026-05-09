@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-linux-io-uring-experimental = ["dep:rustix", "dep:tokio-uring"]
+linux-io-uring-experimental = ["dep:tokio-uring"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -22,9 +22,12 @@ hyper-rustls = { version = "0.27.9", features = ["http1", "http2", "native-tokio
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 indicatif = "0.18.4"
 ratatui = "0.30.0"
-rustix = { version = "1.1.4", optional = true, features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.2", features = ["fs", "full", "io-util", "rt-multi-thread"] }
 tokio-uring = { version = "0.5.0", optional = true }
 url = "2.5.7"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
