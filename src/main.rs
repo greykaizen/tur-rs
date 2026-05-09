@@ -14,10 +14,22 @@ use cli::Cli;
 use engine::{DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ScheduleMode};
 use tui::TuiApp;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = cli.threads {
+        if threads > 0 {
+            builder.worker_threads(threads);
+        }
+    }
+    builder.enable_all();
+
+    let runtime = builder.build()?;
+    runtime.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     if cli.headless {
         return run_headless(cli).await;
     }
