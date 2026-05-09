@@ -33,6 +33,7 @@ enum DownloadFileInner {
     #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
     LinuxIoUring {
         tx: mpsc::UnboundedSender<LinuxIoUringCommand>,
+        fallback: File,
     },
 }
 
@@ -57,17 +58,51 @@ impl DownloadFile {
         match &mut self.inner {
             DownloadFileInner::Tokio(file) => platform::write_all_at_tokio(file, offset, data).await,
             #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
-            DownloadFileInner::LinuxIoUring { tx } => {
-                let (resp_tx, resp_rx) = oneshot::channel();
-                tx.send(LinuxIoUringCommand::WriteAllAt {
-                    offset,
-                    data: data.to_vec(),
-                    resp: resp_tx,
-                })
-                .map_err(|_| anyhow!("io_uring backend thread is not available"))?;
-                resp_rx
-                    .await
-                    .map_err(|_| anyhow!("io_uring backend response channel closed"))??;
+            DownloadFileInner::LinuxIoUring { tx, fallback } => {
+                let alignment = platform::DIRECT_IO_ALIGNMENT as u64;
+                let start = offset;
+                let end = offset + data.len() as u64;
+
+                let aligned_start = if start % alignment == 0 {
+                    start
+                } else {
+                    start + (alignment - (start % alignment))
+                };
+                let aligned_end = end - (end % alignment);
+
+                if aligned_start >= aligned_end {
+                    return platform::write_all_at_tokio(fallback, offset, data).await;
+                }
+
+                let prefix_len = aligned_start.saturating_sub(start) as usize;
+                if prefix_len > 0 {
+                    platform::write_all_at_tokio(fallback, offset, &data[..prefix_len]).await?;
+                }
+
+                let middle_start = prefix_len;
+                let middle_len = (aligned_end - aligned_start) as usize;
+                let middle_end = middle_start + middle_len;
+                if middle_len > 0 {
+                    let mut aligned = AlignedBuffer::new(middle_len, platform::DIRECT_IO_ALIGNMENT);
+                    aligned.as_mut_slice()[..middle_len]
+                        .copy_from_slice(&data[middle_start..middle_end]);
+
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    tx.send(LinuxIoUringCommand::WriteAllAt {
+                        offset: aligned_start,
+                        data: aligned,
+                        resp: resp_tx,
+                    })
+                    .map_err(|_| anyhow!("io_uring backend thread is not available"))?;
+                    resp_rx
+                        .await
+                        .map_err(|_| anyhow!("io_uring backend response channel closed"))??;
+                }
+
+                if middle_end < data.len() {
+                    platform::write_all_at_tokio(fallback, aligned_end, &data[middle_end..]).await?;
+                }
+
                 Ok(())
             }
         }
@@ -77,7 +112,7 @@ impl DownloadFile {
 impl Drop for DownloadFile {
     fn drop(&mut self) {
         #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
-        if let DownloadFileInner::LinuxIoUring { tx } = &self.inner {
+        if let DownloadFileInner::LinuxIoUring { tx, .. } = &self.inner {
             let _ = tx.send(LinuxIoUringCommand::Shutdown);
         }
     }
@@ -142,10 +177,28 @@ impl Drop for AlignedBuffer {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+unsafe impl tokio_uring::buf::IoBuf for AlignedBuffer {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.len()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+unsafe impl Send for AlignedBuffer {}
+
+#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
 enum LinuxIoUringCommand {
     WriteAllAt {
         offset: u64,
-        data: Vec<u8>,
+        data: AlignedBuffer,
         resp: oneshot::Sender<Result<()>>,
     },
     Shutdown,
@@ -224,14 +277,18 @@ mod platform {
 
     #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
     async fn open_download_file_for_write_linux_uring(path: &Path) -> Result<DownloadFile> {
+        use std::os::unix::fs::OpenOptionsExt;
+
         let (tx, mut rx) = mpsc::unbounded_channel::<LinuxIoUringCommand>();
         let path = path.to_path_buf();
+        let fallback = File::from_std(std::fs::OpenOptions::new().write(true).open(&path)?);
         std::thread::Builder::new()
             .name("tur-io-uring".to_string())
             .spawn(move || {
                 tokio_uring::start(async move {
                     let mut options = tokio_uring::fs::OpenOptions::new();
                     options.write(true);
+                    options.custom_flags(libc::O_DIRECT);
                     let file = match options.open(&path).await {
                         Ok(file) => file,
                         Err(_) => return,
@@ -255,7 +312,7 @@ mod platform {
             .map_err(|err| anyhow!("failed to spawn io_uring backend thread: {}", err))?;
 
         Ok(DownloadFile {
-            inner: DownloadFileInner::LinuxIoUring { tx },
+            inner: DownloadFileInner::LinuxIoUring { tx, fallback },
             backend: StorageBackendKind::LinuxIoUringExperimental,
         })
     }
