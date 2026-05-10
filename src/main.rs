@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod connector;
 pub mod engine;
 pub mod storage;
 pub mod tui;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 use uuid::Uuid;
 
 use cli::Cli;
@@ -17,17 +19,11 @@ use tui::TuiApp;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(threads) = cli.threads {
-        if threads > 0 {
-            builder.worker_threads(threads);
-        }
-    }
-    builder.enable_all();
-
-    let runtime = builder.build()?;
-    runtime.block_on(async_main(cli))
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let local = LocalSet::new();
+    local.block_on(&runtime, async_main(cli))
 }
 
 async fn async_main(cli: Cli) -> Result<()> {
@@ -38,15 +34,23 @@ async fn async_main(cli: Cli) -> Result<()> {
     let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
     let http_mode = HttpMode::parse(&cli.http_mode)?;
 
-    let connections = cli.connections;
+    let (connections, min_connections, max_connections) = resolve_connection_settings(&cli)?;
     let tasks_limit = cli.tasks;
+    let max_total_connections = cli.max_total_connections.max(1);
+    let global_bandwidth_limit_bps = mbps_to_bps(cli.bandwidth_limit);
+    let per_download_bandwidth_limit_bps = mbps_to_bps(cli.per_download_limit);
 
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>(100);
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(100);
 
-    let engine = DownloadEngine::new(connections, tasks_limit);
     let engine_cmd_tx = engine_tx.clone();
-    let engine_handle = tokio::spawn(async move {
+    let engine = DownloadEngine::new(
+        connections,
+        tasks_limit,
+        max_total_connections,
+        global_bandwidth_limit_bps,
+    );
+    tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {
             eprintln!("Engine error: {}", e);
         }
@@ -55,6 +59,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     let mut app = TuiApp::new(
         engine_tx.clone(),
         connections,
+        min_connections,
+        max_connections,
+        per_download_bandwidth_limit_bps,
         cli.dry_run,
         cli.dry_run_size_mb,
         cli.borrow_limit_mb,
@@ -71,22 +78,30 @@ async fn async_main(cli: Cli) -> Result<()> {
         eprintln!("TUI error: {}", e);
     }
 
-    engine_handle.abort();
+    drop(engine_tx);
     Ok(())
 }
 
 async fn run_headless(cli: Cli) -> Result<()> {
     let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
     let http_mode = HttpMode::parse(&cli.http_mode)?;
-    let connections = cli.connections;
+    let (connections, min_connections, max_connections) = resolve_connection_settings(&cli)?;
     let tasks_limit = cli.tasks;
+    let max_total_connections = cli.max_total_connections.max(1);
+    let global_bandwidth_limit_bps = mbps_to_bps(cli.bandwidth_limit);
+    let per_download_bandwidth_limit_bps = mbps_to_bps(cli.per_download_limit);
 
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>(100);
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(100);
 
-    let engine = DownloadEngine::new(connections, tasks_limit);
     let engine_cmd_tx = engine_tx.clone();
-    let engine_handle = tokio::spawn(async move {
+    let engine = DownloadEngine::new(
+        connections,
+        tasks_limit,
+        max_total_connections,
+        global_bandwidth_limit_bps,
+    );
+    tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {
             eprintln!("Engine error: {}", e);
         }
@@ -110,6 +125,9 @@ async fn run_headless(cli: Cli) -> Result<()> {
             dry_run: cli.dry_run,
             dry_run_size_mb: cli.dry_run_size_mb,
             borrow_limit_mb: cli.borrow_limit_mb,
+            min_connections,
+            max_connections,
+            per_download_bandwidth_limit_bps,
             schedule_mode,
             http_mode,
             log_root: log_root.clone(),
@@ -153,9 +171,39 @@ async fn run_headless(cli: Cli) -> Result<()> {
         }
     }
 
-    engine_handle.abort();
+    drop(engine_tx);
     if saw_error {
         return Err(anyhow::anyhow!("one or more headless downloads failed"));
     }
     Ok(())
+}
+
+fn mbps_to_bps(mbps: u64) -> u64 {
+    mbps.saturating_mul(1_000_000) / 8
+}
+
+fn resolve_connection_settings(cli: &Cli) -> Result<(usize, usize, usize)> {
+    let default_initial = 8usize;
+    let default_min = 1usize;
+    let default_max = 16usize;
+
+    match (cli.connections, cli.min_connections, cli.max_connections) {
+        (Some(connections), None, None) => {
+            let n = connections.max(1);
+            Ok((n, n, n))
+        }
+        (connections, min_connections, max_connections) => {
+            let initial = connections.unwrap_or(default_initial).max(1);
+            let min_c = min_connections.unwrap_or(default_min).max(1);
+            let max_c = max_connections.unwrap_or(default_max).max(1);
+            if min_c > max_c {
+                return Err(anyhow::anyhow!(
+                    "invalid connection settings: min_connections {} exceeds max_connections {}",
+                    min_c,
+                    max_c
+                ));
+            }
+            Ok((initial.clamp(min_c, max_c), min_c, max_c))
+        }
+    }
 }

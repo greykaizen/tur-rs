@@ -11,17 +11,21 @@ pub struct Cli {
     #[arg(short, long, default_value = ".")]
     pub dir: String,
 
-    /// Connections per download
-    #[arg(short, long, default_value_t = 8)]
-    pub connections: usize,
+    /// Initial connections per download
+    #[arg(short, long)]
+    pub connections: Option<usize>,
+
+    /// Per-download minimum connection count for autonomous scaling
+    #[arg(long)]
+    pub min_connections: Option<usize>,
+
+    /// Per-download maximum connection count for autonomous scaling
+    #[arg(long)]
+    pub max_connections: Option<usize>,
 
     /// Concurrent downloads (tasks)
     #[arg(short, long, default_value_t = 3)]
     pub tasks: usize,
-
-    /// Max threads for the engine pool
-    #[arg(long)]
-    pub threads: Option<usize>,
 
     /// Run the scheduler without issuing range GET requests
     #[arg(long, default_value_t = false)]
@@ -50,4 +54,16 @@ pub struct Cli {
     /// Root directory for engine logs and metadata
     #[arg(long)]
     pub log_root: Option<String>,
+
+    /// System-wide ceiling for active download connections
+    #[arg(long, default_value_t = 32)]
+    pub max_total_connections: usize,
+
+    /// Global bandwidth cap in Mbps, 0 disables the cap
+    #[arg(long, default_value_t = 0)]
+    pub bandwidth_limit: u64,
+
+    /// Per-download bandwidth cap in Mbps, 0 disables the cap
+    #[arg(long, default_value_t = 0)]
+    pub per_download_limit: u64,
 }

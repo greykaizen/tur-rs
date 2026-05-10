@@ -1,6 +1,6 @@
 [package]
 name = "tur"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [features]
@@ -24,8 +24,10 @@ indicatif = "0.18.4"
 ratatui = "0.30.0"
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
+socket2 = { version = "0.6.3", features = ["all"] }
 tokio = { version = "1.52.2", features = ["fs", "full", "io-util", "rt-multi-thread"] }
 tokio-uring = { version = "0.5.0", optional = true }
+tower-service = "0.3.3"
 url = "2.5.7"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 

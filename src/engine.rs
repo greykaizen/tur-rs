@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -16,13 +15,12 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{JoinHandle, LocalSet};
+use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
@@ -51,15 +49,13 @@ const HTTP2_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const HTTP2_MAX_FRAME_BYTES: u32 = 256 * 1024;
 const HTTP2_MAX_SEND_BUFFER_BYTES: usize = 2 * MB as usize;
-const TCP_KEEPALIVE_SECS: u64 = 60;
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 20;
-const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
 const MAX_REDIRECTS: usize = 8;
 const USER_AGENT_VALUE: &str = concat!("tur/", env!("CARGO_PKG_VERSION"));
 
-type DownloadHttpClient = HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+type DownloadHttpClient = HyperClient<HttpsConnector<crate::connector::TunedConnector>, Empty<Bytes>>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DownloadStatus {
@@ -85,6 +81,9 @@ pub struct DownloadTask {
     pub dry_run: bool,
     pub dry_run_size_mb: Option<u64>,
     pub borrow_limit_mb: u64,
+    pub min_connections: usize,
+    pub max_connections: usize,
+    pub per_download_bandwidth_limit_bps: u64,
     pub schedule_mode: ScheduleMode,
     pub http_mode: HttpMode,
     pub log_root: Option<PathBuf>,
@@ -169,6 +168,7 @@ pub enum EngineCommand {
     Resume(Uuid),
     Stop(Uuid),
     Cancel(Uuid),
+    UpdateScaling(Uuid, ScalerConfig),
     RuntimeStopped(TaskSnapshot, HaltMode),
 }
 
@@ -181,41 +181,46 @@ pub enum HaltMode {
 
 #[derive(Debug)]
 struct RuntimeControl {
-    halt_mode: AtomicU8,
-    cancel_flag: AtomicBool,
+    halt_mode: Cell<HaltMode>,
+    cancel_flag: Cell<bool>,
+    scaler_config: Rc<RefCell<ScalerConfig>>,
 }
 
 impl RuntimeControl {
-    fn new() -> Self {
+    fn new(scaler_config: ScalerConfig) -> Self {
         Self {
-            halt_mode: AtomicU8::new(HaltMode::Running as u8),
-            cancel_flag: AtomicBool::new(false),
+            halt_mode: Cell::new(HaltMode::Running),
+            cancel_flag: Cell::new(false),
+            scaler_config: Rc::new(RefCell::new(scaler_config)),
         }
     }
 
     fn halt_mode(&self) -> HaltMode {
-        match self.halt_mode.load(Ordering::Acquire) {
-            1 => HaltMode::PauseMemory,
-            2 => HaltMode::PersistToDisk,
-            _ => HaltMode::Running,
-        }
+        self.halt_mode.get()
     }
 
     fn request_pause(&self) {
-        self.halt_mode
-            .store(HaltMode::PauseMemory as u8, Ordering::Release);
-        self.cancel_flag.store(true, Ordering::Release);
+        self.halt_mode.set(HaltMode::PauseMemory);
+        self.cancel_flag.set(true);
     }
 
     fn request_persist(&self) {
-        self.halt_mode
-            .store(HaltMode::PersistToDisk as u8, Ordering::Release);
-        self.cancel_flag.store(true, Ordering::Release);
+        self.halt_mode.set(HaltMode::PersistToDisk);
+        self.cancel_flag.set(true);
     }
 
     fn is_halted(&self) -> bool {
-        self.halt_mode() != HaltMode::Running || self.cancel_flag.load(Ordering::Acquire)
+        self.halt_mode() != HaltMode::Running || self.cancel_flag.get()
     }
+
+    fn scaler_config(&self) -> Rc<RefCell<ScalerConfig>> {
+        self.scaler_config.clone()
+    }
+}
+
+enum PendingLaunch {
+    Fresh(DownloadTask),
+    Resume(TaskSnapshot),
 }
 
 #[derive(Debug, Default)]
@@ -282,10 +287,122 @@ impl SchedulerMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct ScalerConfig {
+    pub min_connections: usize,
+    pub max_connections: usize,
+    pub heartbeat_ms: u64,
+}
+
+impl Default for ScalerConfig {
+    fn default() -> Self {
+        Self {
+            min_connections: 1,
+            max_connections: 16,
+            heartbeat_ms: 2000,
+        }
+    }
+}
+
+pub struct TokenBucket {
+    pub quota_bytes_per_sec: Cell<u64>,
+    pub tokens: Cell<i64>,
+}
+
+impl TokenBucket {
+    pub fn new() -> Self {
+        Self {
+            quota_bytes_per_sec: Cell::new(0),
+            tokens: Cell::new(0),
+        }
+    }
+
+    pub fn refill(&self, interval_ms: u64) {
+        let quota = self.quota_bytes_per_sec.get();
+        if quota == 0 {
+            self.tokens.set(i64::MAX / 2);
+            return;
+        }
+        let add = (quota * interval_ms / 1000) as i64;
+        let cap = (quota * 2) as i64;
+        self.tokens.set((self.tokens.get() + add).min(cap));
+    }
+
+    pub fn consume(&self, bytes: usize) -> bool {
+        let quota = self.quota_bytes_per_sec.get();
+        if quota == 0 {
+            return true;
+        }
+        let remaining = self.tokens.get() - bytes as i64;
+        self.tokens.set(remaining);
+        remaining >= 0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ScalerAction {
+    Grow,
+    Shrink,
+    Hold,
+}
+
+pub struct Scaler {
+    pub ewma_throughput: Cell<f64>,
+    pub peak_efficiency: Cell<f64>,
+    pub throughput_before_add: Cell<f64>,
+    pub n_active: Cell<usize>,
+    pub last_action: Cell<ScalerAction>,
+    pub slow_start_remaining: Cell<u32>,
+    pub config: Rc<RefCell<ScalerConfig>>,
+}
+
+impl Scaler {
+    pub fn new(config: ScalerConfig) -> Rc<Self> {
+        Rc::new(Self {
+            ewma_throughput: Cell::new(0.0),
+            peak_efficiency: Cell::new(0.0),
+            throughput_before_add: Cell::new(0.0),
+            n_active: Cell::new(1),
+            last_action: Cell::new(ScalerAction::Grow),
+            slow_start_remaining: Cell::new(3),
+            config: Rc::new(RefCell::new(config)),
+        })
+    }
+}
+
+pub struct DownloadHandle {
+    pub id: Uuid,
+    pub bucket: Rc<TokenBucket>,
+    pub per_download_limit_bps: u64,
+}
+
+pub struct WorkerControl {
+    pub connection_id: u32,
+    pub stop_requested: Cell<bool>,
+    pub transferred_bytes: Cell<u64>,
+}
+
+impl WorkerControl {
+    fn new(connection_id: u32) -> Rc<Self> {
+        Rc::new(Self {
+            connection_id,
+            stop_requested: Cell::new(false),
+            transferred_bytes: Cell::new(0),
+        })
+    }
+}
+
+struct WorkerSlot {
+    control: Rc<WorkerControl>,
+    handle: JoinHandle<()>,
+}
+
 pub struct DownloadEngine {
     pub connections_per_download: usize,
     pub max_concurrent_tasks: usize,
+    pub connection_budget: Cell<usize>,
+    pub global_bandwidth_limit: Cell<u64>,
+    pub downloads: RefCell<Vec<DownloadHandle>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +414,8 @@ struct RangeSpec {
     byte_end: u64,
 }
 
+const INITIAL_PHI_MAX_RATIO: f64 = 1.5;
+const STORAGE_BLOCK_SIZE: u64 = 4194304; // 4MB
 const RANGE_STATUS_PENDING: u8 = 0;
 const RANGE_STATUS_ACTIVE: u8 = 1;
 const RANGE_STATUS_FINISHED: u8 = 2;
@@ -441,89 +560,200 @@ impl IndexStateMap {
 }
 
 impl DownloadEngine {
-    pub fn new(connections_per_download: usize, max_concurrent_tasks: usize) -> Self {
-        Self {
+    pub fn new(
+        connections_per_download: usize,
+        max_concurrent_tasks: usize,
+        max_total_connections: usize,
+        global_bandwidth_limit_bps: u64,
+    ) -> Rc<Self> {
+        Rc::new(Self {
             connections_per_download,
             max_concurrent_tasks,
+            connection_budget: Cell::new(max_total_connections.max(1)),
+            global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
+            downloads: RefCell::new(Vec::new()),
+        })
+    }
+
+    pub fn request_connection(&self) -> bool {
+        let current = self.connection_budget.get();
+        if current > 0 {
+            self.connection_budget.set(current - 1);
+            true
+        } else {
+            false
         }
     }
 
+    pub fn release_connection(&self) {
+        self.connection_budget.set(self.connection_budget.get() + 1);
+    }
+
     pub async fn run(
-        &self,
+        self: Rc<Self>,
         mut cmd_rx: mpsc::Receiver<EngineCommand>,
         cmd_tx: mpsc::Sender<EngineCommand>,
         event_tx: mpsc::Sender<EngineEvent>,
     ) -> Result<()> {
-        let mut active_controls: HashMap<Uuid, Arc<RuntimeControl>> = HashMap::new();
+        let mut active_controls: HashMap<Uuid, Rc<RuntimeControl>> = HashMap::new();
         let mut paused_tasks: HashMap<Uuid, TaskSnapshot> = HashMap::new();
         let mut persisted_paths: HashMap<Uuid, PathBuf> = HashMap::new();
+        let mut pending_launches = VecDeque::<PendingLaunch>::new();
 
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                EngineCommand::Add(task) => {
-                    let control = Arc::new(RuntimeControl::new());
-                    active_controls.insert(task.id, control.clone());
-                    self.spawn_download_task(task, None, control, cmd_tx.clone(), event_tx.clone());
-                }
-                EngineCommand::Stop(id) => {
-                    if let Some(control) = active_controls.get(&id) {
-                        control.request_pause();
-                    }
-                }
-                EngineCommand::Cancel(id) => {
-                    if let Some(control) = active_controls.get(&id) {
-                        control.request_persist();
-                    }
-                }
-                EngineCommand::Resume(id) => {
-                    if active_controls.contains_key(&id) {
-                        continue;
-                    }
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
 
-                    let snapshot = if let Some(snapshot) = paused_tasks.remove(&id) {
-                        snapshot
-                    } else {
-                        let path = persisted_paths
-                            .get(&id)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("No paused or persisted task found for {}", id))?;
-                        load_snapshot(&path)?
-                    };
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    while active_controls.len() < self.max_concurrent_tasks {
+                        let Some(next_launch) = pending_launches.pop_front() else { break; };
+                        match next_launch {
+                            PendingLaunch::Fresh(task) => {
+                                let control = Rc::new(RuntimeControl::new(ScalerConfig {
+                                    min_connections: task.min_connections,
+                                    max_connections: task.max_connections,
+                                    heartbeat_ms: 2000,
+                                }));
+                                active_controls.insert(task.id, control.clone());
 
-                    let control = Arc::new(RuntimeControl::new());
-                    active_controls.insert(id, control.clone());
-                    self.spawn_download_task(
-                        snapshot.task.clone(),
-                        Some(snapshot),
-                        control,
-                        cmd_tx.clone(),
-                        event_tx.clone(),
-                    );
-                }
-                EngineCommand::RuntimeStopped(snapshot, halt_mode) => {
-                    active_controls.remove(&snapshot.task.id);
-                    match halt_mode {
-                        HaltMode::PauseMemory => {
-                            paused_tasks.insert(snapshot.task.id, snapshot.clone());
-                            let _ = event_tx
-                                .send(EngineEvent::StatusChanged(
-                                    snapshot.task.id,
-                                    DownloadStatus::Paused,
-                                ))
-                                .await;
+                                let bucket = Rc::new(TokenBucket::new());
+                                self.downloads.borrow_mut().push(DownloadHandle {
+                                    id: task.id,
+                                    bucket: bucket.clone(),
+                                    per_download_limit_bps: task.per_download_bandwidth_limit_bps,
+                                });
+
+                                self.spawn_download_task(task, None, control, bucket, cmd_tx.clone(), event_tx.clone());
+                            }
+                            PendingLaunch::Resume(snapshot) => {
+                                let task = snapshot.task.clone();
+                                let control = Rc::new(RuntimeControl::new(ScalerConfig {
+                                    min_connections: task.min_connections,
+                                    max_connections: task.max_connections,
+                                    heartbeat_ms: 2000,
+                                }));
+                                active_controls.insert(task.id, control.clone());
+
+                                let bucket = Rc::new(TokenBucket::new());
+                                self.downloads.borrow_mut().push(DownloadHandle {
+                                    id: task.id,
+                                    bucket: bucket.clone(),
+                                    per_download_limit_bps: task.per_download_bandwidth_limit_bps,
+                                });
+
+                                self.spawn_download_task(task, Some(snapshot), control, bucket, cmd_tx.clone(), event_tx.clone());
+                            }
                         }
-                        HaltMode::PersistToDisk => {
-                            let path = metadata_path(&snapshot.task);
-                            persist_snapshot(&path, &snapshot)?;
-                            persisted_paths.insert(snapshot.task.id, path);
-                            let _ = event_tx
-                                .send(EngineEvent::StatusChanged(
-                                    snapshot.task.id,
-                                    DownloadStatus::Stopped,
-                                ))
-                                .await;
+                    }
+
+                    let downloads = self.downloads.borrow();
+                    let n_active = downloads.len();
+                    if n_active > 0 {
+                        let global_limit = self.global_bandwidth_limit.get();
+                        let per_download = if global_limit == 0 {
+                            0
+                        } else {
+                            global_limit / n_active as u64
+                        };
+                        for handle in downloads.iter() {
+                            let quota = if per_download == 0 {
+                                handle.per_download_limit_bps
+                            } else if handle.per_download_limit_bps == 0 {
+                                per_download
+                            } else {
+                                per_download.min(handle.per_download_limit_bps)
+                            };
+                            handle.bucket.quota_bytes_per_sec.set(quota);
+                            handle.bucket.refill(100);
                         }
-                        HaltMode::Running => {}
+                    }
+                }
+                cmd_opt = cmd_rx.recv() => {
+                    let Some(cmd) = cmd_opt else { break; };
+                    match cmd {
+                        EngineCommand::Add(task) => {
+                            pending_launches.push_back(PendingLaunch::Fresh(task));
+                        }
+                        EngineCommand::Stop(id) => {
+                            if let Some(control) = active_controls.get(&id) {
+                                control.request_pause();
+                            }
+                        }
+                        EngineCommand::Cancel(id) => {
+                            if let Some(control) = active_controls.get(&id) {
+                                control.request_persist();
+                            }
+                        }
+                        EngineCommand::Resume(id) => {
+                            if active_controls.contains_key(&id) {
+                                continue;
+                            }
+
+                            let snapshot = if let Some(snapshot) = paused_tasks.remove(&id) {
+                                snapshot
+                            } else {
+                                let path = persisted_paths
+                                    .get(&id)
+                                    .cloned()
+                                    .ok_or_else(|| anyhow!("No paused or persisted task found for {}", id))?;
+                                load_snapshot(&path)?
+                            };
+                            pending_launches.push_back(PendingLaunch::Resume(snapshot));
+                        }
+                        EngineCommand::UpdateScaling(id, config) => {
+                            if config.min_connections > config.max_connections {
+                                let _ = event_tx
+                                    .send(EngineEvent::StatusChanged(
+                                        id,
+                                        DownloadStatus::Error(format!(
+                                            "invalid scaling update: min_connections {} exceeds max_connections {}",
+                                            config.min_connections, config.max_connections
+                                        )),
+                                    ))
+                                    .await;
+                                continue;
+                            }
+
+                            if let Some(control) = active_controls.get(&id) {
+                                *control.scaler_config().borrow_mut() = config;
+                            } else if let Some(snapshot) = paused_tasks.get_mut(&id) {
+                                snapshot.task.min_connections = config.min_connections;
+                                snapshot.task.max_connections = config.max_connections;
+                            } else if let Some(path) = persisted_paths.get(&id).cloned() {
+                                let mut snapshot = load_snapshot(&path)?;
+                                snapshot.task.min_connections = config.min_connections;
+                                snapshot.task.max_connections = config.max_connections;
+                                persist_snapshot(&path, &snapshot)?;
+                            }
+                        }
+                        EngineCommand::RuntimeStopped(snapshot, halt_mode) => {
+                            active_controls.remove(&snapshot.task.id);
+                            self.downloads.borrow_mut().retain(|h| h.id != snapshot.task.id);
+                            
+                            match halt_mode {
+                                HaltMode::PauseMemory => {
+                                    paused_tasks.insert(snapshot.task.id, snapshot.clone());
+                                    let _ = event_tx
+                                        .send(EngineEvent::StatusChanged(
+                                            snapshot.task.id,
+                                            DownloadStatus::Paused,
+                                        ))
+                                        .await;
+                                }
+                                HaltMode::PersistToDisk => {
+                                    let path = metadata_path(&snapshot.task);
+                                    persist_snapshot(&path, &snapshot)?;
+                                    persisted_paths.insert(snapshot.task.id, path);
+                                    let _ = event_tx
+                                        .send(EngineEvent::StatusChanged(
+                                            snapshot.task.id,
+                                            DownloadStatus::Stopped,
+                                        ))
+                                        .await;
+                                }
+                                HaltMode::Running => {}
+                            }
+                        }
                     }
                 }
             }
@@ -533,72 +763,66 @@ impl DownloadEngine {
     }
 
     fn spawn_download_task(
-        &self,
+        self: &Rc<Self>,
         task: DownloadTask,
         snapshot: Option<TaskSnapshot>,
-        control: Arc<RuntimeControl>,
+        control: Rc<RuntimeControl>,
+        bucket: Rc<TokenBucket>,
         cmd_tx: mpsc::Sender<EngineCommand>,
         event_tx: mpsc::Sender<EngineEvent>,
     ) {
         let default_connections = self.connections_per_download;
-        std::thread::spawn(move || {
+        let engine = self.clone();
+        tokio::task::spawn_local(async move {
             let task_id = task.id;
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    let _ = event_tx.blocking_send(EngineEvent::StatusChanged(
-                        task_id,
-                        DownloadStatus::Error(format!("failed to create download runtime: {}", err)),
-                    ));
-                    return;
-                }
-            };
-            let result = runtime.block_on(run_download_task(
+            let result = run_download_task(
+                engine,
                 task,
                 snapshot,
                 control,
+                bucket,
                 cmd_tx.clone(),
                 event_tx.clone(),
                 default_connections,
-            ));
+            ).await;
             if let Err(err) = result {
-                let _ = event_tx.blocking_send(EngineEvent::StatusChanged(
+                let _ = event_tx.send(EngineEvent::StatusChanged(
                     task_id,
                     DownloadStatus::Error(err.to_string()),
-                ));
+                )).await;
             }
         });
     }
 }
 
 async fn run_download_task(
+    engine: Rc<DownloadEngine>,
     task: DownloadTask,
     snapshot: Option<TaskSnapshot>,
-    control: Arc<RuntimeControl>,
+    control: Rc<RuntimeControl>,
+    bucket: Rc<TokenBucket>,
     cmd_tx: mpsc::Sender<EngineCommand>,
     event_tx: mpsc::Sender<EngineEvent>,
     default_connections: usize,
 ) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(run_download_task_local(
-            task,
-            snapshot,
-            control,
-            cmd_tx,
-            event_tx,
-            default_connections,
-        ))
-        .await
+    run_download_task_local(
+        engine,
+        task,
+        snapshot,
+        control,
+        bucket,
+        cmd_tx,
+        event_tx,
+        default_connections,
+    ).await
 }
 
 async fn run_download_task_local(
+    engine: Rc<DownloadEngine>,
     mut task: DownloadTask,
     snapshot: Option<TaskSnapshot>,
-    control: Arc<RuntimeControl>,
+    control: Rc<RuntimeControl>,
+    bucket: Rc<TokenBucket>,
     cmd_tx: mpsc::Sender<EngineCommand>,
     event_tx: mpsc::Sender<EngineEvent>,
     default_connections: usize,
@@ -668,10 +892,68 @@ async fn run_download_task_local(
     }
 
     let (work_tx, work_rx) = mpsc::channel(128);
-    let mut handles = Vec::with_capacity(task.connections);
     let http_client = build_http_client(task.http_mode);
 
-    for connection_id in 0..task.connections {
+    let min_connections = task.min_connections.max(1).min(task.max_connections.max(1));
+    let max_connections = task.max_connections.max(min_connections);
+    task.connections = task.connections.clamp(min_connections, max_connections);
+
+    let scaler_config = ScalerConfig {
+        min_connections,
+        max_connections,
+        heartbeat_ms: 2000,
+    };
+    {
+        let config = control.scaler_config();
+        *config.borrow_mut() = scaler_config;
+    }
+    let scaler = Scaler {
+        ewma_throughput: Cell::new(0.0),
+        peak_efficiency: Cell::new(0.0),
+        throughput_before_add: Cell::new(0.0),
+        n_active: Cell::new(1),
+        last_action: Cell::new(ScalerAction::Grow),
+        slow_start_remaining: Cell::new(3),
+        config: control.scaler_config(),
+    };
+    let scaler = Rc::new(scaler);
+    let scaler_engine = engine.clone();
+
+    let handles = Rc::new(RefCell::new(Vec::<WorkerSlot>::new()));
+    let leased_connections = Rc::new(Cell::new(0usize));
+    let desired_initial_connections = task.connections.max(1);
+    let mut initial_connections = 0usize;
+    while initial_connections == 0 {
+        if control.is_halted() {
+            break;
+        }
+        if engine.request_connection() {
+            initial_connections = 1;
+            leased_connections.set(leased_connections.get() + 1);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    while initial_connections < desired_initial_connections {
+        if !engine.request_connection() {
+            break;
+        }
+        initial_connections += 1;
+        leased_connections.set(leased_connections.get() + 1);
+    }
+    if initial_connections == 0 {
+        let _ = event_tx
+            .send(EngineEvent::StatusChanged(
+                task.id,
+                DownloadStatus::Error("no connection budget available".to_string()),
+            ))
+            .await;
+        return Ok(());
+    }
+    scaler.n_active.set(initial_connections);
+
+    for connection_id in 0..initial_connections {
+        let worker_control = WorkerControl::new(connection_id as u32);
         let worker = ConnectionWorker {
             connection_id: connection_id as u32,
             url: task.url.clone(),
@@ -680,15 +962,189 @@ async fn run_download_task_local(
             coordinator_tx: work_tx.clone(),
             global_downloaded: global_downloaded.clone(),
             control: control.clone(),
+            worker_control: worker_control.clone(),
             dry_run: task.dry_run,
             borrow_limit_bytes: task.borrow_limit_mb * MB,
             metrics: metrics.clone(),
             client: http_client.clone(),
             index_state: index_state.clone(),
+            bucket: bucket.clone(),
         };
 
-        handles.push(tokio::task::spawn_local(async move { worker.run().await }));
+        let handle = tokio::task::spawn_local(async move {
+            let _ = worker.run().await;
+        });
+        handles.borrow_mut().push(WorkerSlot {
+            control: worker_control,
+            handle,
+        });
     }
+
+    let scaler_handles = handles.clone();
+    let scaler_leased_connections = leased_connections.clone();
+    let scaler_work_tx = work_tx.clone();
+    let scaler_url = task.url.clone();
+    let scaler_file_path = file_path.clone();
+    let scaler_log_path = log_path.clone();
+    let scaler_global_downloaded = global_downloaded.clone();
+    let scaler_control = control.clone();
+    let scaler_metrics = metrics.clone();
+    let scaler_http_client = http_client.clone();
+    let scaler_index_state = index_state.clone();
+    let scaler_bucket = bucket.clone();
+    let scaler_borrow_limit = task.borrow_limit_mb * MB;
+    let scaler_dry_run = task.dry_run;
+    let mut connection_id_counter = initial_connections as u32;
+    let mut worker_history: HashMap<u32, (u64, u64)> = HashMap::new();
+
+    let scaler_task = tokio::task::spawn_local(async move {
+        let mut last_downloaded = scaler_global_downloaded.get();
+        let mut tick = tokio::time::interval(Duration::from_millis(scaler.config.borrow().heartbeat_ms));
+        
+        loop {
+            tick.tick().await;
+            if scaler_control.is_halted() || scaler_global_downloaded.get() >= total_size {
+                break;
+            }
+
+            let current_downloaded = scaler_global_downloaded.get();
+            let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
+            last_downloaded = current_downloaded;
+
+            let interval_secs = scaler.config.borrow().heartbeat_ms as f64 / 1000.0;
+            let current_throughput = downloaded_in_tick as f64 / interval_secs;
+
+            let ewma = scaler.ewma_throughput.get();
+            let new_ewma = if ewma == 0.0 {
+                current_throughput
+            } else {
+                (ewma * 0.7) + (current_throughput * 0.3)
+            };
+            scaler.ewma_throughput.set(new_ewma);
+
+            let n_active = scaler.n_active.get();
+            if n_active == 0 {
+                continue;
+            }
+
+            let current_efficiency = new_ewma / n_active as f64;
+            let peak = scaler.peak_efficiency.get();
+            if current_efficiency > peak {
+                scaler.peak_efficiency.set(current_efficiency);
+            }
+
+            let slow_start = scaler.slow_start_remaining.get();
+            if slow_start > 0 {
+                scaler.slow_start_remaining.set(slow_start - 1);
+                continue;
+            }
+
+            let config = scaler.config.borrow();
+            let min_c = config.min_connections;
+            let max_c = config.max_connections;
+            let last_action = scaler.last_action.get();
+
+            let weakest_connection = {
+                let slots = scaler_handles.borrow();
+                let mut weakest = None::<(u32, u64)>;
+                for slot in slots.iter() {
+                    if slot.control.stop_requested.get() {
+                        continue;
+                    }
+                    let current_total = slot.control.transferred_bytes.get();
+                    let (prev_total, prev_delta) = worker_history
+                        .get(&slot.control.connection_id)
+                        .copied()
+                        .unwrap_or((current_total, 0));
+                    let current_delta = current_total.saturating_sub(prev_total);
+                    worker_history.insert(slot.control.connection_id, (current_total, current_delta));
+                    let score = prev_delta.saturating_add(current_delta);
+                    match weakest {
+                        Some((_, best_score)) if best_score <= score => {}
+                        _ => weakest = Some((slot.control.connection_id, score)),
+                    }
+                }
+                weakest.map(|(connection_id, _)| connection_id)
+            };
+
+            let mut did_add = false;
+            let mut drop_connection_id = None::<u32>;
+
+            if last_action == ScalerAction::Grow {
+                let prev = scaler.throughput_before_add.get();
+                if prev > 0.0 {
+                    let marginal_gain = (new_ewma - prev) / prev;
+                    if marginal_gain < -0.03 {
+                        if n_active > min_c {
+                            drop_connection_id = weakest_connection;
+                        }
+                        scaler.last_action.set(ScalerAction::Hold);
+                    } else if marginal_gain >= 0.05 {
+                        scaler.last_action.set(ScalerAction::Hold);
+                    }
+                }
+            } else if current_efficiency < 0.85 * scaler.peak_efficiency.get() && n_active > min_c {
+                drop_connection_id = weakest_connection;
+            } else if n_active < max_c {
+                if scaler_engine.request_connection() {
+                    scaler.throughput_before_add.set(new_ewma);
+                    did_add = true;
+                    scaler.slow_start_remaining.set(3);
+                    scaler.last_action.set(ScalerAction::Grow);
+                    scaler_leased_connections.set(scaler_leased_connections.get() + 1);
+                }
+            }
+
+            if let Some(connection_id) = drop_connection_id {
+                let mut dropped = false;
+                for slot in scaler_handles.borrow().iter() {
+                    if slot.control.connection_id != connection_id || slot.control.stop_requested.get() {
+                        continue;
+                    }
+                    slot.control.stop_requested.set(true);
+                    dropped = true;
+                    break;
+                }
+                if dropped {
+                    scaler.n_active.set(n_active - 1);
+                    scaler_engine.release_connection();
+                    scaler_leased_connections
+                        .set(scaler_leased_connections.get().saturating_sub(1));
+                    scaler.last_action.set(ScalerAction::Shrink);
+                }
+            }
+
+            if did_add {
+                let worker_control = WorkerControl::new(connection_id_counter);
+                let worker = ConnectionWorker {
+                    connection_id: connection_id_counter,
+                    url: scaler_url.clone(),
+                    file_path: scaler_file_path.clone(),
+                    log_path: scaler_log_path.clone(),
+                    coordinator_tx: scaler_work_tx.clone(),
+                    global_downloaded: scaler_global_downloaded.clone(),
+                    control: scaler_control.clone(),
+                    worker_control: worker_control.clone(),
+                    dry_run: scaler_dry_run,
+                    borrow_limit_bytes: scaler_borrow_limit,
+                    metrics: scaler_metrics.clone(),
+                    client: scaler_http_client.clone(),
+                    index_state: scaler_index_state.clone(),
+                    bucket: scaler_bucket.clone(),
+                };
+                connection_id_counter += 1;
+                let handle = tokio::task::spawn_local(async move {
+                    let _ = worker.run().await;
+                });
+                scaler_handles.borrow_mut().push(WorkerSlot {
+                    control: worker_control,
+                    handle,
+                });
+                scaler.n_active.set(n_active + 1);
+            }
+        }
+    });
+
     drop(work_tx);
 
     let progress_task_id = task.id;
@@ -728,9 +1184,26 @@ async fn run_download_task_local(
 
     coordinator.run(work_rx, control.clone()).await;
 
-    for handle in handles {
+    scaler_task.abort();
+    {
+        let final_handles = handles.borrow();
+        for slot in final_handles.iter() {
+            slot.control.stop_requested.set(true);
+        }
+    }
+    let drained_handles: Vec<JoinHandle<()>> = {
+        let mut final_handles = handles.borrow_mut();
+        final_handles.drain(..).map(|slot| slot.handle).collect()
+    };
+    for handle in drained_handles {
         let _ = handle.await;
     }
+
+    let remaining_leases = leased_connections.replace(0);
+    for _ in 0..remaining_leases {
+        engine.release_connection();
+    }
+
     let _ = progress_handle.await;
 
     coordinator.log_summary(total_size);
@@ -807,13 +1280,24 @@ impl Coordinator {
 
         let seed_ranges = match schedule_mode {
             ScheduleMode::FibAdaptive => {
-                build_phi_geometric_ranges(total_size, connections.max(1), 1.5, 4194304)
+                build_phi_geometric_ranges(total_size, connections.max(1), INITIAL_PHI_MAX_RATIO, STORAGE_BLOCK_SIZE)
             }
             ScheduleMode::Fib => {
                 let seed_start_idx = choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
                 build_seed_ranges(&fib_mb, seed_start_idx, support_idx, total_size)
             }
             ScheduleMode::Equal => build_equal_ranges(total_size, connections.max(1)),
+        };
+
+        let geometry_label = if seed_ranges.len() > 1 {
+            let mut labels = Vec::new();
+            for r in &seed_ranges {
+                let pct = (r.byte_end - r.byte_start) as f64 / total_size as f64 * 100.0;
+                labels.push(format!("{:.1}%", pct));
+            }
+            labels.join(" / ")
+        } else {
+            "100%".to_string()
         };
         let dl_ranges: Vec<Rc<ActiveRange>> = seed_ranges
             .iter()
@@ -862,6 +1346,7 @@ impl Coordinator {
             coordinator.index_state.bucket_count(),
             coordinator.index_state.storage_bytes(),
         ));
+        coordinator.log(&format!("Initial distribution geometry: [{}]", geometry_label));
         let range_lines: Vec<String> = seed_ranges
             .iter()
             .map(|spec| {
@@ -953,7 +1438,7 @@ impl Coordinator {
         ));
     }
 
-    async fn run(&mut self, mut work_rx: mpsc::Receiver<WorkRequest>, control: Arc<RuntimeControl>) {
+    async fn run(&mut self, mut work_rx: mpsc::Receiver<WorkRequest>, control: Rc<RuntimeControl>) {
         while let Some(req) = work_rx.recv().await {
             if control.is_halted() {
                 let _ = req.tx.send(None);
@@ -989,6 +1474,32 @@ impl Coordinator {
                 range.end.get()
             ));
             return Some(range);
+        }
+
+        for idx in 0..self.dl_ranges.len() {
+            let range = self.dl_ranges[idx].clone();
+            if range.assigned_to.get() != UNASSIGNED_CONNECTION {
+                continue;
+            }
+            if range.status.get() != RANGE_STATUS_PENDING {
+                continue;
+            }
+            if range.cursor.get() >= range.end.get() {
+                continue;
+            }
+            range.assigned_to.set(connection_id);
+            range.status.set(RANGE_STATUS_ACTIVE);
+            SchedulerMetrics::add(&self.metrics.direct_assignments, 1);
+            self.log(&format!(
+                "reassign conn={} active_range#{} support={}..{}MB bytes={}..{}",
+                connection_id,
+                range.id,
+                range.label_start_mb,
+                range.label_end_mb,
+                range.cursor.get(),
+                range.end.get()
+            ));
+            return Some(range.clone());
         }
 
         self.borrow_work(connection_id)
@@ -1062,6 +1573,7 @@ impl Coordinator {
             return Some((idx, BorrowKind::Straggler));
         }
 
+        let mut best_standard = None::<(usize, u64)>;
         for offset in 0..total {
             let idx = (self.borrow_cursor + offset) % total;
             let active = &self.dl_ranges[idx];
@@ -1076,6 +1588,14 @@ impl Coordinator {
             if remaining <= effective_limit.saturating_mul(2) {
                 continue;
             }
+            
+            match best_standard {
+                Some((_, best_remaining)) if best_remaining >= remaining => {}
+                _ => best_standard = Some((idx, remaining)),
+            }
+        }
+
+        if let Some((idx, _)) = best_standard {
             let kind = if self.is_tail_phase() {
                 BorrowKind::Tail
             } else {
@@ -1216,12 +1736,14 @@ struct ConnectionWorker {
     log_path: PathBuf,
     coordinator_tx: mpsc::Sender<WorkRequest>,
     global_downloaded: Rc<Cell<u64>>,
-    control: Arc<RuntimeControl>,
+    control: Rc<RuntimeControl>,
+    worker_control: Rc<WorkerControl>,
     dry_run: bool,
     borrow_limit_bytes: u64,
     metrics: Rc<SchedulerMetrics>,
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
+    bucket: Rc<TokenBucket>,
 }
 
 #[derive(Debug, Default)]
@@ -1253,6 +1775,22 @@ struct StartupProbe {
 }
 
 impl ConnectionWorker {
+    fn should_exit_for_scale_down(&self) -> bool {
+        self.worker_control.stop_requested.get()
+    }
+
+    async fn relinquish_range(&self, range: &Rc<ActiveRange>, local_cursor: u64) {
+        range.cursor.set(local_cursor);
+        range.assigned_to.set(UNASSIGNED_CONNECTION);
+        range.status.set(RANGE_STATUS_PENDING);
+        self.log_msg(&format!(
+            "range#{} relinquished at byte={} for scale-down",
+            range.id,
+            local_cursor
+        ))
+        .await;
+    }
+
     fn note_first_assignment(&self, startup: &mut StartupProbe, wait_started: Instant) {
         if startup.first_assignment_wait_ms.is_none() {
             let waited_ms = wait_started.elapsed().as_millis() as u64;
@@ -1424,7 +1962,7 @@ impl ConnectionWorker {
         let mut local_cursor = 0_u64;
 
         loop {
-            if self.control.is_halted() {
+            if self.control.is_halted() || self.should_exit_for_scale_down() {
                 break;
             }
 
@@ -1472,6 +2010,9 @@ impl ConnectionWorker {
                 .set(self.global_downloaded.get().saturating_add(step));
             self.index_state.mark_completed_span(local_cursor, new_pos);
             local_cursor = new_pos;
+            self.worker_control
+                .transferred_bytes
+                .set(self.worker_control.transferred_bytes.get().saturating_add(step));
             let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
 
             let remaining = end.saturating_sub(new_pos);
@@ -1689,6 +2230,10 @@ impl ConnectionWorker {
                     Err(_) => continue,
                 };
 
+                while !self.bucket.consume(chunk.len()) {
+                    tokio::task::yield_now().await;
+                }
+
                 if first_chunk_at.is_none() {
                     first_chunk_at = Some(Instant::now());
                     attempt_timing.first_byte_ms = stream_started.elapsed().as_millis() as u64;
@@ -1733,6 +2278,12 @@ impl ConnectionWorker {
                 made_progress_this_attempt = true;
                 attempt_timing.bytes_written = attempt_timing.bytes_written.saturating_add(to_write as u64);
                 attempt_timing.chunks = attempt_timing.chunks.saturating_add(1);
+                self.worker_control.transferred_bytes.set(
+                    self.worker_control
+                        .transferred_bytes
+                        .get()
+                        .saturating_add(to_write as u64),
+                );
                 local_cursor = new_pos;
                 let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
                 self.update_pending_write_target(&mut pending_write, recent_speed_bps);
@@ -1762,6 +2313,19 @@ impl ConnectionWorker {
                     .await?
                 {
                     no_more_work_hint = true;
+                }
+
+                if self.should_exit_for_scale_down() {
+                    self
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
+                        .await?;
+                    self.relinquish_range(&range, local_cursor).await;
+                    if let Some(handle) = prefetch_handle {
+                        handle.abort();
+                    }
+                    drop(write_tx);
+                    let _ = writer_handle.await;
+                    return Ok(());
                 }
 
                 if to_write < chunk.len() {
@@ -2236,12 +2800,7 @@ fn http_version_label(version: Version) -> &'static str {
 }
 
 fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    http.set_nodelay(true);
-    http.set_keepalive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS)));
-    http.set_keepalive_interval(Some(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS)));
-    http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+    let http = crate::connector::TunedConnector::new();
     let https = match http_mode {
         HttpMode::Auto => HttpsConnectorBuilder::new()
             .with_webpki_roots()
