@@ -254,12 +254,13 @@ struct SchedulerMetrics {
     fresh_requests: Cell<u64>,
     fresh_handshake_ms: Cell<u64>,
     skipped_growth_samples: Cell<u64>,
+    adaptive_min_steal_bytes_final: Cell<u64>,
 }
 
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -288,6 +289,7 @@ impl SchedulerMetrics {
             self.fresh_requests.get(),
             self.fresh_handshake_ms.get(),
             self.skipped_growth_samples.get(),
+            self.adaptive_min_steal_bytes_final.get(),
         )
     }
 
@@ -517,6 +519,7 @@ struct Coordinator {
     dl_ranges: Vec<Rc<ActiveRange>>,
     next_unassigned_idx: usize,
     borrow_limit_bytes: u64,
+    adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     borrow_cursor: usize,
     next_range_id: u64,
     total_size: u64,
@@ -894,6 +897,9 @@ async fn run_download_task_local(
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
+    let adaptive_minimum_steal_bytes = Rc::new(Cell::new(
+        (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
+    ));
     let mut coordinator = if let Some(snapshot) = snapshot {
         Coordinator::from_snapshot(
             snapshot.coordinator,
@@ -901,6 +907,7 @@ async fn run_download_task_local(
             &log_path,
             task.schedule_mode,
             metrics.clone(),
+            adaptive_minimum_steal_bytes.clone(),
         )?
     } else {
         Coordinator::new(
@@ -912,6 +919,7 @@ async fn run_download_task_local(
             task.dry_run,
             task.schedule_mode,
             metrics.clone(),
+            adaptive_minimum_steal_bytes.clone(),
         )?
     };
 
@@ -1031,6 +1039,7 @@ async fn run_download_task_local(
     let scaler_index_state = index_state.clone();
     let scaler_bucket = bucket.clone();
     let scaler_borrow_limit = task.borrow_limit_mb * MB;
+    let scaler_adaptive_minimum_steal_bytes = adaptive_minimum_steal_bytes.clone();
     let scaler_dry_run = task.dry_run;
     let mut connection_id_counter = initial_connections as u32;
     let mut worker_history: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -1050,7 +1059,8 @@ async fn run_download_task_local(
             let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
             last_downloaded = current_downloaded;
 
-            let interval_secs = scaler_for_task.config.borrow().heartbeat_ms as f64 / 1000.0;
+            let heartbeat_ms = scaler_for_task.config.borrow().heartbeat_ms.max(1);
+            let interval_secs = heartbeat_ms as f64 / 1000.0;
             let current_throughput = downloaded_in_tick as f64 / interval_secs;
             let (alpha, _cv) = update_scaler_signal_stats(&scaler_for_task, current_throughput);
             let skip_growth_sample = scaler_for_task.skip_growth_sample.replace(false);
@@ -1067,6 +1077,10 @@ async fn run_download_task_local(
                 scaler_for_task.ewma_throughput.set(updated);
                 updated
             };
+            let bytes_per_heartbeat = new_ewma * interval_secs;
+            let adaptive_min_steal_bytes =
+                ((bytes_per_heartbeat / 4.0).round() as u64).max(2 * STORAGE_BLOCK_SIZE);
+            scaler_adaptive_minimum_steal_bytes.set(adaptive_min_steal_bytes);
             update_reuse_health(&scaler_for_task, &scaler_url, &scaler_log_path).await;
 
             let n_active = scaler_for_task.n_active.get();
@@ -1120,7 +1134,7 @@ async fn run_download_task_local(
             log_phase_a_info(
                 &scaler_log_path,
                 &format!(
-                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={}",
+                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} adaptive_min_steal_bytes={}",
                     new_ewma,
                     scaler_for_task.alpha.get(),
                     scaler_for_task.cv.get(),
@@ -1130,6 +1144,7 @@ async fn run_download_task_local(
                     scaler_for_task.reuse_rate.get(),
                     scaler_for_task.effective_add_threshold.get(),
                     scaler_for_task.slow_start_remaining.get(),
+                    adaptive_min_steal_bytes,
                 ),
             )
             .await;
@@ -1362,6 +1377,7 @@ impl Coordinator {
         dry_run: bool,
         schedule_mode: ScheduleMode,
         metrics: Rc<SchedulerMetrics>,
+        adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     ) -> Result<Self> {
         let fib_mb = build_fib_mb();
         let ceil_mb = total_size.div_ceil(MB);
@@ -1415,6 +1431,7 @@ impl Coordinator {
             dl_ranges,
             next_unassigned_idx: 0,
             borrow_limit_bytes: borrow_limit_mb.max(1) * MB,
+            adaptive_minimum_steal_bytes,
             borrow_cursor: 0,
             next_range_id: seed_ranges.len() as u64 + 1,
             total_size,
@@ -1467,6 +1484,7 @@ impl Coordinator {
         log_path: &Path,
         _schedule_mode: ScheduleMode,
         metrics: Rc<SchedulerMetrics>,
+        adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     ) -> Result<Self> {
         let dl_ranges = snapshot
             .dl_ranges
@@ -1493,6 +1511,7 @@ impl Coordinator {
             dl_ranges,
             next_unassigned_idx: snapshot.next_unassigned_idx,
             borrow_limit_bytes: snapshot.borrow_limit_bytes,
+            adaptive_minimum_steal_bytes,
             borrow_cursor: snapshot.borrow_cursor,
             next_range_id: snapshot.next_range_id,
             total_size,
@@ -1518,6 +1537,9 @@ impl Coordinator {
     }
 
     fn log_summary(&mut self, total_size: u64) {
+        self.metrics
+            .adaptive_min_steal_bytes_final
+            .set(self.adaptive_minimum_steal_bytes.get());
         self.log(&format!(
             "{} total_size={} final_ranges={} vector_consumed={} index_state_buckets={} index_state_bytes={} completed_slices={}",
             self.metrics.summary_line(),
@@ -1780,11 +1802,12 @@ impl Coordinator {
     }
 
     fn effective_borrow_limit_bytes(&self) -> u64 {
-        if self.is_tail_phase() {
+        let base_limit = if self.is_tail_phase() {
             self.borrow_limit_bytes.min(MB).max(MB)
         } else {
             self.borrow_limit_bytes
-        }
+        };
+        base_limit.max(self.adaptive_minimum_steal_bytes.get())
     }
 
     fn is_tail_phase(&self) -> bool {

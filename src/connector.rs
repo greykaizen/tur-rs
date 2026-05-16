@@ -45,14 +45,14 @@ impl Service<Uri> for TunedConnector {
 
             #[cfg(target_os = "linux")]
             {
-                if let Err(err) = sock.set_tcp_quickack(true) {
+                if let Err(_err) = sock.set_tcp_quickack(true) {
                     #[cfg(debug_assertions)]
-                    eprintln!("DEBUG: TCP_QUICKACK failed: {}", err);
+                    eprintln!("DEBUG: TCP_QUICKACK failed: {}", _err);
                 }
 
-                if let Err(err) = sock.set_tcp_congestion(b"bbr") {
+                if let Err(_err) = sock.set_tcp_congestion(b"bbr") {
                     #[cfg(debug_assertions)]
-                    eprintln!("DEBUG: TCP_CONGESTION(bbr) failed: {}", err);
+                    eprintln!("DEBUG: TCP_CONGESTION(bbr) failed: {}", _err);
                 }
             }
 
