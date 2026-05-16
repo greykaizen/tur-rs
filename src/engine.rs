@@ -1103,7 +1103,7 @@ async fn run_download_task_local(
             let next_heartbeat_ms = compute_heartbeat_ms(&scaler_for_task);
             scaler_for_task.config.borrow_mut().heartbeat_ms = next_heartbeat_ms;
             heartbeat_ms_for_tick = next_heartbeat_ms;
-            let bytes_per_heartbeat = new_ewma * (next_heartbeat_ms as f64 / 1000.0);
+            let bytes_per_heartbeat = new_ewma * interval_secs;
             let adaptive_min_steal_bytes =
                 ((bytes_per_heartbeat / 4.0).round() as u64).max(2 * STORAGE_BLOCK_SIZE);
             scaler_adaptive_minimum_steal_bytes.set(adaptive_min_steal_bytes);
