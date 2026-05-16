@@ -33,6 +33,7 @@ const DEFAULT_BORROW_LIMIT_MB: u64 = 2;
 const LIVE_SEED_FLOOR_MB: u64 = 13;
 const LIVE_PREFETCH_MIN_MB: u64 = 2;
 const LIVE_PREFETCH_HANDSHAKE_MS: u64 = 700;
+const MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD: u64 = 2;
 const MAX_RANGE_RETRIES: u32 = 8;
 const RETRY_BASE_DELAY_MS: u64 = 250;
 const RETRY_MAX_DELAY_MS: u64 = 2_000;
@@ -249,12 +250,16 @@ struct SchedulerMetrics {
     startup_first_request_setup_ms: Cell<u64>,
     startup_first_byte_ms: Cell<u64>,
     startup_total_to_first_byte_ms: Cell<u64>,
+    reused_requests: Cell<u64>,
+    fresh_requests: Cell<u64>,
+    fresh_handshake_ms: Cell<u64>,
+    skipped_growth_samples: Cell<u64>,
 }
 
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -279,6 +284,10 @@ impl SchedulerMetrics {
             self.startup_first_request_setup_ms.get(),
             self.startup_first_byte_ms.get(),
             self.startup_total_to_first_byte_ms.get(),
+            self.reused_requests.get(),
+            self.fresh_requests.get(),
+            self.fresh_handshake_ms.get(),
+            self.skipped_growth_samples.get(),
         )
     }
 
@@ -354,18 +363,52 @@ pub struct Scaler {
     pub last_action: Cell<ScalerAction>,
     pub slow_start_remaining: Cell<u32>,
     pub config: Rc<RefCell<ScalerConfig>>,
+    pub sample_ring: RefCell<[f64; 10]>,
+    pub sample_head: Cell<usize>,
+    pub sample_count: Cell<usize>,
+    pub alpha: Cell<f64>,
+    pub cv: Cell<f64>,
+    pub ewma_rtt_ms: Cell<f64>,
+    pub ewma_handshake_ms: Cell<f64>,
+    pub reused_count: Cell<u64>,
+    pub total_request_count: Cell<u64>,
+    pub reuse_rate: Cell<f64>,
+    pub last_reuse_reset: Cell<Instant>,
+    pub effective_add_threshold: Cell<f64>,
+    pub reused_rtt_samples: Cell<u64>,
+    pub skip_growth_sample: Cell<bool>,
+    pub reuse_health_low: Cell<bool>,
 }
 
 impl Scaler {
     pub fn new(config: ScalerConfig) -> Rc<Self> {
+        Self::from_config_handle(Rc::new(RefCell::new(config)))
+    }
+
+    pub fn from_config_handle(config: Rc<RefCell<ScalerConfig>>) -> Rc<Self> {
         Rc::new(Self {
             ewma_throughput: Cell::new(0.0),
             peak_efficiency: Cell::new(0.0),
             throughput_before_add: Cell::new(0.0),
             n_active: Cell::new(1),
-            last_action: Cell::new(ScalerAction::Grow),
+            last_action: Cell::new(ScalerAction::Hold),
             slow_start_remaining: Cell::new(3),
-            config: Rc::new(RefCell::new(config)),
+            config,
+            sample_ring: RefCell::new([0.0; 10]),
+            sample_head: Cell::new(0),
+            sample_count: Cell::new(0),
+            alpha: Cell::new(0.3),
+            cv: Cell::new(0.0),
+            ewma_rtt_ms: Cell::new(200.0),
+            ewma_handshake_ms: Cell::new(50.0),
+            reused_count: Cell::new(0),
+            total_request_count: Cell::new(0),
+            reuse_rate: Cell::new(1.0),
+            last_reuse_reset: Cell::new(Instant::now()),
+            effective_add_threshold: Cell::new(0.05),
+            reused_rtt_samples: Cell::new(0),
+            skip_growth_sample: Cell::new(false),
+            reuse_health_low: Cell::new(false),
         })
     }
 }
@@ -380,6 +423,7 @@ pub struct WorkerControl {
     pub connection_id: u32,
     pub stop_requested: Cell<bool>,
     pub transferred_bytes: Cell<u64>,
+    pub pending_growth_probe: Cell<bool>,
 }
 
 impl WorkerControl {
@@ -388,6 +432,7 @@ impl WorkerControl {
             connection_id,
             stop_requested: Cell::new(false),
             transferred_bytes: Cell::new(0),
+            pending_growth_probe: Cell::new(false),
         })
     }
 }
@@ -907,16 +952,7 @@ async fn run_download_task_local(
         let config = control.scaler_config();
         *config.borrow_mut() = scaler_config;
     }
-    let scaler = Scaler {
-        ewma_throughput: Cell::new(0.0),
-        peak_efficiency: Cell::new(0.0),
-        throughput_before_add: Cell::new(0.0),
-        n_active: Cell::new(1),
-        last_action: Cell::new(ScalerAction::Grow),
-        slow_start_remaining: Cell::new(3),
-        config: control.scaler_config(),
-    };
-    let scaler = Rc::new(scaler);
+    let scaler = Scaler::from_config_handle(control.scaler_config());
     let scaler_engine = engine.clone();
 
     let handles = Rc::new(RefCell::new(Vec::<WorkerSlot>::new()));
@@ -954,6 +990,7 @@ async fn run_download_task_local(
 
     for connection_id in 0..initial_connections {
         let worker_control = WorkerControl::new(connection_id as u32);
+        worker_control.pending_growth_probe.set(false);
         let worker = ConnectionWorker {
             connection_id: connection_id as u32,
             url: task.url.clone(),
@@ -969,6 +1006,7 @@ async fn run_download_task_local(
             client: http_client.clone(),
             index_state: index_state.clone(),
             bucket: bucket.clone(),
+            scaler: scaler.clone(),
         };
 
         let handle = tokio::task::spawn_local(async move {
@@ -997,9 +1035,10 @@ async fn run_download_task_local(
     let mut connection_id_counter = initial_connections as u32;
     let mut worker_history: HashMap<u32, (u64, u64)> = HashMap::new();
 
+    let scaler_for_task = scaler.clone();
     let scaler_task = tokio::task::spawn_local(async move {
         let mut last_downloaded = scaler_global_downloaded.get();
-        let mut tick = tokio::time::interval(Duration::from_millis(scaler.config.borrow().heartbeat_ms));
+        let mut tick = tokio::time::interval(Duration::from_millis(scaler_for_task.config.borrow().heartbeat_ms));
         
         loop {
             tick.tick().await;
@@ -1011,38 +1050,46 @@ async fn run_download_task_local(
             let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
             last_downloaded = current_downloaded;
 
-            let interval_secs = scaler.config.borrow().heartbeat_ms as f64 / 1000.0;
+            let interval_secs = scaler_for_task.config.borrow().heartbeat_ms as f64 / 1000.0;
             let current_throughput = downloaded_in_tick as f64 / interval_secs;
-
-            let ewma = scaler.ewma_throughput.get();
-            let new_ewma = if ewma == 0.0 {
-                current_throughput
+            let (alpha, _cv) = update_scaler_signal_stats(&scaler_for_task, current_throughput);
+            let skip_growth_sample = scaler_for_task.skip_growth_sample.replace(false);
+            let new_ewma = if skip_growth_sample {
+                SchedulerMetrics::add(&scaler_metrics.skipped_growth_samples, 1);
+                scaler_for_task.ewma_throughput.get()
             } else {
-                (ewma * 0.7) + (current_throughput * 0.3)
+                let ewma = scaler_for_task.ewma_throughput.get();
+                let updated = if ewma == 0.0 {
+                    current_throughput
+                } else {
+                    (ewma * (1.0 - alpha)) + (current_throughput * alpha)
+                };
+                scaler_for_task.ewma_throughput.set(updated);
+                updated
             };
-            scaler.ewma_throughput.set(new_ewma);
+            update_reuse_health(&scaler_for_task, &scaler_url, &scaler_log_path).await;
 
-            let n_active = scaler.n_active.get();
+            let n_active = scaler_for_task.n_active.get();
             if n_active == 0 {
                 continue;
             }
 
             let current_efficiency = new_ewma / n_active as f64;
-            let peak = scaler.peak_efficiency.get();
+            let peak = scaler_for_task.peak_efficiency.get();
             if current_efficiency > peak {
-                scaler.peak_efficiency.set(current_efficiency);
+                scaler_for_task.peak_efficiency.set(current_efficiency);
             }
 
-            let slow_start = scaler.slow_start_remaining.get();
+            let slow_start = scaler_for_task.slow_start_remaining.get();
             if slow_start > 0 {
-                scaler.slow_start_remaining.set(slow_start - 1);
+                scaler_for_task.slow_start_remaining.set(slow_start - 1);
                 continue;
             }
 
-            let config = scaler.config.borrow();
+            let config = scaler_for_task.config.borrow();
             let min_c = config.min_connections;
             let max_c = config.max_connections;
-            let last_action = scaler.last_action.get();
+            let last_action = scaler_for_task.last_action.get();
 
             let weakest_connection = {
                 let slots = scaler_handles.borrow();
@@ -1070,27 +1117,44 @@ async fn run_download_task_local(
             let mut did_add = false;
             let mut drop_connection_id = None::<u32>;
 
+            log_phase_a_info(
+                &scaler_log_path,
+                &format!(
+                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={}",
+                    new_ewma,
+                    scaler_for_task.alpha.get(),
+                    scaler_for_task.cv.get(),
+                    n_active,
+                    current_efficiency,
+                    scaler_for_task.peak_efficiency.get(),
+                    scaler_for_task.reuse_rate.get(),
+                    scaler_for_task.effective_add_threshold.get(),
+                    scaler_for_task.slow_start_remaining.get(),
+                ),
+            )
+            .await;
+
             if last_action == ScalerAction::Grow {
-                let prev = scaler.throughput_before_add.get();
+                let prev = scaler_for_task.throughput_before_add.get();
                 if prev > 0.0 {
                     let marginal_gain = (new_ewma - prev) / prev;
                     if marginal_gain < -0.03 {
                         if n_active > min_c {
                             drop_connection_id = weakest_connection;
                         }
-                        scaler.last_action.set(ScalerAction::Hold);
-                    } else if marginal_gain >= 0.05 {
-                        scaler.last_action.set(ScalerAction::Hold);
+                        scaler_for_task.last_action.set(ScalerAction::Hold);
+                    } else if marginal_gain >= scaler_for_task.effective_add_threshold.get() {
+                        scaler_for_task.last_action.set(ScalerAction::Hold);
                     }
                 }
-            } else if current_efficiency < 0.85 * scaler.peak_efficiency.get() && n_active > min_c {
+            } else if current_efficiency < 0.85 * scaler_for_task.peak_efficiency.get() && n_active > min_c {
                 drop_connection_id = weakest_connection;
             } else if n_active < max_c {
                 if scaler_engine.request_connection() {
-                    scaler.throughput_before_add.set(new_ewma);
+                    scaler_for_task.throughput_before_add.set(new_ewma);
                     did_add = true;
-                    scaler.slow_start_remaining.set(3);
-                    scaler.last_action.set(ScalerAction::Grow);
+                    scaler_for_task.slow_start_remaining.set(compute_slow_start_heartbeats(&scaler_for_task));
+                    scaler_for_task.last_action.set(ScalerAction::Grow);
                     scaler_leased_connections.set(scaler_leased_connections.get() + 1);
                 }
             }
@@ -1106,16 +1170,22 @@ async fn run_download_task_local(
                     break;
                 }
                 if dropped {
-                    scaler.n_active.set(n_active - 1);
+                    scaler_for_task.n_active.set(n_active - 1);
                     scaler_engine.release_connection();
                     scaler_leased_connections
                         .set(scaler_leased_connections.get().saturating_sub(1));
-                    scaler.last_action.set(ScalerAction::Shrink);
+                    scaler_for_task.last_action.set(ScalerAction::Shrink);
+                    log_phase_a_info(
+                        &scaler_log_path,
+                        &format!("scale_drop connection_id={} n_active={}", connection_id, scaler_for_task.n_active.get()),
+                    )
+                    .await;
                 }
             }
 
             if did_add {
                 let worker_control = WorkerControl::new(connection_id_counter);
+                worker_control.pending_growth_probe.set(true);
                 let worker = ConnectionWorker {
                     connection_id: connection_id_counter,
                     url: scaler_url.clone(),
@@ -1131,6 +1201,7 @@ async fn run_download_task_local(
                     client: scaler_http_client.clone(),
                     index_state: scaler_index_state.clone(),
                     bucket: scaler_bucket.clone(),
+                    scaler: scaler_for_task.clone(),
                 };
                 connection_id_counter += 1;
                 let handle = tokio::task::spawn_local(async move {
@@ -1140,7 +1211,17 @@ async fn run_download_task_local(
                     control: worker_control,
                     handle,
                 });
-                scaler.n_active.set(n_active + 1);
+                scaler_for_task.n_active.set(n_active + 1);
+                log_phase_a_info(
+                    &scaler_log_path,
+                    &format!(
+                        "scale_add connection_id={} n_active={} slow_start_remaining={}",
+                        connection_id_counter - 1,
+                        scaler_for_task.n_active.get(),
+                        scaler_for_task.slow_start_remaining.get(),
+                    ),
+                )
+                .await;
             }
         }
     });
@@ -1207,6 +1288,17 @@ async fn run_download_task_local(
     let _ = progress_handle.await;
 
     coordinator.log_summary(total_size);
+    coordinator.log(&format!(
+        "phase_a_summary alpha={:.3} cv={:.3} ewma_rtt_ms={:.1} ewma_handshake_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} reused_rtt_samples={}",
+        scaler.alpha.get(),
+        scaler.cv.get(),
+        scaler.ewma_rtt_ms.get(),
+        scaler.ewma_handshake_ms.get(),
+        scaler.reuse_rate.get(),
+        scaler.effective_add_threshold.get(),
+        scaler.slow_start_remaining.get(),
+        scaler.reused_rtt_samples.get(),
+    ));
 
     match control.halt_mode() {
         HaltMode::Running => {
@@ -1744,6 +1836,7 @@ struct ConnectionWorker {
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
     bucket: Rc<TokenBucket>,
+    scaler: Rc<Scaler>,
 }
 
 #[derive(Debug, Default)]
@@ -1754,6 +1847,8 @@ struct AttemptTiming {
     write_ms: u64,
     bytes_written: u64,
     chunks: u64,
+    request_kind: Option<RequestKind>,
+    handshake_cost_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1772,6 +1867,12 @@ struct StartupProbe {
     first_byte_ms: Option<u64>,
     total_to_first_byte_ms: Option<u64>,
     logged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Reused,
+    Fresh,
 }
 
 impl ConnectionWorker {
@@ -1828,6 +1929,97 @@ impl ConnectionWorker {
         ))
         .await;
         startup.logged = true;
+    }
+
+    async fn record_request_classification(
+        &self,
+        attempt_timing: &mut AttemptTiming,
+        total_ttfb_ms: u64,
+    ) {
+        let was_growth_probe = self.worker_control.pending_growth_probe.replace(false);
+        let ttfb_ms = total_ttfb_ms as f64;
+        let ewma_rtt_ms = self.scaler.ewma_rtt_ms.get();
+        let threshold_ms = ewma_rtt_ms * 1.5;
+        let kind = if ttfb_ms < threshold_ms {
+            RequestKind::Reused
+        } else {
+            RequestKind::Fresh
+        };
+        attempt_timing.request_kind = Some(kind);
+        self.scaler
+            .total_request_count
+            .set(self.scaler.total_request_count.get().saturating_add(1));
+
+        match kind {
+            RequestKind::Reused => {
+                self.scaler
+                    .reused_count
+                    .set(self.scaler.reused_count.get().saturating_add(1));
+                let prev = self.scaler.ewma_rtt_ms.get();
+                let updated = if self.scaler.reused_rtt_samples.get() == 0 {
+                    ttfb_ms
+                } else {
+                    0.25 * ttfb_ms + 0.75 * prev
+                };
+                self.scaler.ewma_rtt_ms.set(updated);
+                self.scaler
+                    .reused_rtt_samples
+                    .set(self.scaler.reused_rtt_samples.get().saturating_add(1));
+                SchedulerMetrics::add(&self.metrics.reused_requests, 1);
+            }
+            RequestKind::Fresh => {
+                let handshake_cost_ms = (ttfb_ms - ewma_rtt_ms.max(1.0)).max(0.0);
+                attempt_timing.handshake_cost_ms = handshake_cost_ms.round() as u64;
+                let prev = self.scaler.ewma_handshake_ms.get();
+                let updated = 0.25 * handshake_cost_ms + 0.75 * prev;
+                self.scaler.ewma_handshake_ms.set(updated);
+                SchedulerMetrics::add(&self.metrics.fresh_requests, 1);
+                SchedulerMetrics::add(
+                    &self.metrics.fresh_handshake_ms,
+                    attempt_timing.handshake_cost_ms,
+                );
+
+                if was_growth_probe
+                    && self.scaler.last_action.get() == ScalerAction::Grow
+                    && self.scaler.reused_rtt_samples.get() >= MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD
+                {
+                    self.scaler.skip_growth_sample.set(true);
+                    let heartbeat_ms = self.scaler.config.borrow().heartbeat_ms.max(1);
+                    let extra_heartbeats =
+                        ((attempt_timing.handshake_cost_ms + heartbeat_ms - 1) / heartbeat_ms) as u32;
+                    self.scaler.slow_start_remaining.set(
+                        self.scaler
+                            .slow_start_remaining
+                            .get()
+                            .saturating_add(extra_heartbeats.max(1)),
+                    );
+                    self.log_msg(&format!(
+                        "growth_probe_shield handshake_ms={} extra_heartbeats={} reused_rtt_samples={}",
+                        attempt_timing.handshake_cost_ms,
+                        extra_heartbeats.max(1),
+                        self.scaler.reused_rtt_samples.get(),
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        let total_requests = self.scaler.total_request_count.get();
+        if total_requests > 0 {
+            self.scaler.reuse_rate.set(
+                self.scaler.reused_count.get() as f64 / total_requests as f64,
+            );
+        }
+
+        self.log_msg(&format!(
+            "request_classified kind={:?} total_ttfb_ms={} ewma_rtt_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2}",
+            kind,
+            total_ttfb_ms,
+            self.scaler.ewma_rtt_ms.get(),
+            self.scaler.reuse_rate.get(),
+            self.scaler.effective_add_threshold.get(),
+        ))
+        .await;
     }
 
     async fn flush_pending_write(
@@ -2238,6 +2430,15 @@ impl ConnectionWorker {
                     first_chunk_at = Some(Instant::now());
                     attempt_timing.first_byte_ms = stream_started.elapsed().as_millis() as u64;
                     SchedulerMetrics::add(&self.metrics.http_ttfb_ms, attempt_timing.first_byte_ms);
+                    let total_ttfb_ms = attempt_timing
+                        .request_setup_ms
+                        .saturating_add(attempt_timing.first_byte_ms);
+                    self
+                        .record_request_classification(
+                            &mut attempt_timing,
+                            total_ttfb_ms,
+                        )
+                        .await;
                     if startup.first_byte_ms.is_none() {
                         startup.first_byte_ms = Some(attempt_timing.first_byte_ms);
                         startup.total_to_first_byte_ms =
@@ -2466,10 +2667,11 @@ impl ConnectionWorker {
         http_version: &str,
     ) {
         self.log_msg(&format!(
-            "range#{} {} version={} requested={}..{} advanced_to={} setup_ms={} first_byte_ms={} stream_ms={} write_ms={} bytes={} chunks={}",
+            "range#{} {} version={} kind={:?} requested={}..{} advanced_to={} setup_ms={} first_byte_ms={} stream_ms={} write_ms={} handshake_ms={} bytes={} chunks={}",
             range.id,
             outcome,
             http_version,
+            attempt_timing.request_kind,
             requested_start,
             requested_end,
             range.cursor.get(),
@@ -2477,6 +2679,7 @@ impl ConnectionWorker {
             attempt_timing.first_byte_ms,
             attempt_timing.stream_ms,
             attempt_timing.write_ms,
+            attempt_timing.handshake_cost_ms,
             attempt_timing.bytes_written,
             attempt_timing.chunks,
         ))
@@ -2746,6 +2949,114 @@ fn should_prefetch(remaining_bytes: u64, recent_speed_bps: f64, borrow_limit_byt
     let handshake_bytes = ((recent_speed_bps * (LIVE_PREFETCH_HANDSHAKE_MS as f64 / 1000.0)).ceil())
         .max((LIVE_PREFETCH_MIN_MB * MB) as f64) as u64;
     remaining_bytes <= handshake_bytes.max(borrow_limit_bytes)
+}
+
+fn update_scaler_signal_stats(scaler: &Rc<Scaler>, sample_bps: f64) -> (f64, f64) {
+    {
+        let mut ring = scaler.sample_ring.borrow_mut();
+        ring[scaler.sample_head.get()] = sample_bps;
+    }
+    scaler
+        .sample_head
+        .set((scaler.sample_head.get() + 1) % 10);
+    scaler
+        .sample_count
+        .set((scaler.sample_count.get() + 1).min(10));
+
+    let count = scaler.sample_count.get();
+    if count < 5 {
+        scaler.alpha.set(0.3);
+        scaler.cv.set(0.0);
+        return (0.3, 0.0);
+    }
+
+    let ring = scaler.sample_ring.borrow();
+    let values = &ring[..count];
+    let mean = values.iter().sum::<f64>() / count as f64;
+    if mean < 1.0 {
+        scaler.alpha.set(0.3);
+        scaler.cv.set(0.0);
+        return (0.3, 0.0);
+    }
+
+    let variance = values
+        .iter()
+        .map(|sample| {
+            let delta = *sample - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count as f64;
+    let cv = variance.sqrt() / mean;
+    let alpha = (0.5 - 0.4 * cv).clamp(0.10, 0.50);
+    scaler.cv.set(cv);
+    scaler.alpha.set(alpha);
+    (alpha, cv)
+}
+
+fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>) -> u32 {
+    let heartbeat_ms = scaler.config.borrow().heartbeat_ms.max(1) as f64;
+    let estimated_ms = scaler.ewma_rtt_ms.get() * 12.0;
+    ((estimated_ms / heartbeat_ms).ceil() as u32).clamp(1, 4)
+}
+
+async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
+    let now = Instant::now();
+    if now.duration_since(scaler.last_reuse_reset.get()) >= Duration::from_secs(60) {
+        scaler.reused_count.set(0);
+        scaler.total_request_count.set(0);
+        scaler.reuse_rate.set(1.0);
+        scaler.last_reuse_reset.set(now);
+    }
+
+    let rate = if scaler.total_request_count.get() == 0 {
+        scaler.reuse_rate.get()
+    } else {
+        scaler.reused_count.get() as f64 / scaler.total_request_count.get() as f64
+    };
+    scaler.reuse_rate.set(rate);
+    let threshold = (if rate < 0.5 { 0.10_f64 } else { 0.05_f64 }).clamp(0.05, 0.15);
+    scaler.effective_add_threshold.set(threshold);
+
+    let was_low = scaler.reuse_health_low.get();
+    if !was_low && rate < 0.5 {
+        scaler.reuse_health_low.set(true);
+        log_phase_a_info(
+            log_path,
+            &format!(
+                "reuse health degraded url={} reuse_rate={:.2} effective_add_threshold={:.2}",
+                url,
+                rate,
+                threshold
+            ),
+        )
+        .await;
+    } else if was_low && rate > 0.7 {
+        scaler.reuse_health_low.set(false);
+        log_phase_a_info(
+            log_path,
+            &format!(
+                "reuse health recovered url={} reuse_rate={:.2} effective_add_threshold={:.2}",
+                url,
+                rate,
+                threshold
+            ),
+        )
+        .await;
+    }
+}
+
+async fn log_phase_a_info(log_path: &Path, msg: &str) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await
+    {
+        let _ = f
+            .write_all(format!("[{}] phase_a: {}\n", chrono::Local::now(), msg).as_bytes())
+            .await;
+    }
 }
 
 fn median_u64(values: &mut [u64]) -> u64 {
