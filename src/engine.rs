@@ -21,6 +21,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use sysinfo::System;
 use url::Url;
 use uuid::Uuid;
 
@@ -453,9 +454,13 @@ struct WorkerSlot {
 pub struct DownloadEngine {
     pub connections_per_download: usize,
     pub max_concurrent_tasks: usize,
+    pub configured_connection_budget: Cell<usize>,
+    pub effective_connection_budget: Cell<usize>,
     pub connection_budget: Cell<usize>,
     pub global_bandwidth_limit: Cell<u64>,
     pub refill_interval_ms: Cell<u64>,
+    pub last_memory_check: Cell<Instant>,
+    pub max_ratio_for_next_download: Cell<f64>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
 
@@ -621,12 +626,17 @@ impl DownloadEngine {
         max_total_connections: usize,
         global_bandwidth_limit_bps: u64,
     ) -> Rc<Self> {
+        let configured_budget = max_total_connections.max(1);
         Rc::new(Self {
             connections_per_download,
             max_concurrent_tasks,
-            connection_budget: Cell::new(max_total_connections.max(1)),
+            configured_connection_budget: Cell::new(configured_budget),
+            effective_connection_budget: Cell::new(configured_budget),
+            connection_budget: Cell::new(configured_budget),
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
             refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
+            last_memory_check: Cell::new(Instant::now()),
+            max_ratio_for_next_download: Cell::new(INITIAL_PHI_MAX_RATIO),
             downloads: RefCell::new(Vec::new()),
         })
     }
@@ -642,7 +652,9 @@ impl DownloadEngine {
     }
 
     pub fn release_connection(&self) {
-        self.connection_budget.set(self.connection_budget.get() + 1);
+        let next = self.connection_budget.get().saturating_add(1);
+        self.connection_budget
+            .set(next.min(self.effective_connection_budget.get()));
     }
 
     pub async fn run(
@@ -656,6 +668,7 @@ impl DownloadEngine {
         let mut persisted_paths: HashMap<Uuid, PathBuf> = HashMap::new();
         let mut pending_launches = VecDeque::<PendingLaunch>::new();
         let mut last_refill_recompute = Instant::now();
+        let mut memory_system = System::new();
 
         loop {
             let refill_sleep_ms = self.refill_interval_ms.get().max(10);
@@ -663,6 +676,38 @@ impl DownloadEngine {
             tokio::pin!(refill_sleep);
             tokio::select! {
                 _ = &mut refill_sleep => {
+                    if self.last_memory_check.get().elapsed() >= Duration::from_secs(30) {
+                        memory_system.refresh_memory();
+                        let available_mb = memory_system.available_memory() / (1024 * 1024);
+                        let configured_budget = self.configured_connection_budget.get();
+                        let previous_effective = self.effective_connection_budget.get();
+                        let new_effective =
+                            compute_effective_connection_budget(configured_budget, available_mb);
+                        if new_effective != previous_effective {
+                            let current_available = self.connection_budget.get().min(previous_effective);
+                            let active_leases = previous_effective.saturating_sub(current_available);
+                            let new_available = new_effective.saturating_sub(active_leases.min(new_effective));
+                            self.effective_connection_budget.set(new_effective);
+                            self.connection_budget.set(new_available);
+                            if new_effective < previous_effective {
+                                eprintln!(
+                                    "INFO: memory pressure reduced connection budget available_mb={} effective_budget={}/{}",
+                                    available_mb,
+                                    new_effective,
+                                    configured_budget
+                                );
+                            } else {
+                                eprintln!(
+                                    "INFO: memory pressure restored connection budget available_mb={} effective_budget={}/{}",
+                                    available_mb,
+                                    new_effective,
+                                    configured_budget
+                                );
+                            }
+                        }
+                        self.last_memory_check.set(Instant::now());
+                    }
+
                     while active_controls.len() < self.max_concurrent_tasks {
                         let Some(next_launch) = pending_launches.pop_front() else { break; };
                         match next_launch {
@@ -918,6 +963,7 @@ async fn run_download_task_local(
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
+    let phi_max_ratio = engine.max_ratio_for_next_download.get();
     let adaptive_minimum_steal_bytes = Rc::new(Cell::new(
         (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
     ));
@@ -941,6 +987,7 @@ async fn run_download_task_local(
             task.schedule_mode,
             metrics.clone(),
             adaptive_minimum_steal_bytes.clone(),
+            phi_max_ratio,
         )?
     };
 
@@ -1066,6 +1113,7 @@ async fn run_download_task_local(
     let scaler_dry_run = task.dry_run;
     let mut connection_id_counter = initial_connections as u32;
     let mut worker_history: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut phi_ratio_recorded = false;
 
     let scaler_for_task = scaler.clone();
     let scaler_task = tokio::task::spawn_local(async move {
@@ -1134,6 +1182,7 @@ async fn run_download_task_local(
             let weakest_connection = {
                 let slots = scaler_handles.borrow();
                 let mut weakest = None::<(u32, u64)>;
+                let mut connection_speeds = Vec::<f64>::new();
                 for slot in slots.iter() {
                     if slot.control.stop_requested.get() {
                         continue;
@@ -1146,9 +1195,28 @@ async fn run_download_task_local(
                     let current_delta = current_total.saturating_sub(prev_total);
                     worker_history.insert(slot.control.connection_id, (current_total, current_delta));
                     let score = prev_delta.saturating_add(current_delta);
+                    if current_delta > 0 {
+                        connection_speeds.push(current_delta as f64 / interval_secs);
+                    }
                     match weakest {
                         Some((_, best_score)) if best_score <= score => {}
                         _ => weakest = Some((slot.control.connection_id, score)),
+                    }
+                }
+                if !phi_ratio_recorded {
+                    if let Some(cv_connections) = compute_connection_cv(&connection_speeds) {
+                        let next_phi_ratio = (1.0 + cv_connections).clamp(1.1, 2.5);
+                        scaler_engine.max_ratio_for_next_download.set(next_phi_ratio);
+                        phi_ratio_recorded = true;
+                        log_phase_a_info(
+                            &scaler_log_path,
+                            &format!(
+                                "phase_d: next_phi_ratio_updated cv_connections={:.3} max_ratio_for_next_download={:.3}",
+                                cv_connections,
+                                next_phi_ratio
+                            ),
+                        )
+                        .await;
                     }
                 }
                 weakest.map(|(connection_id, _)| connection_id)
@@ -1355,6 +1423,12 @@ async fn run_download_task_local(
         control.scaler_config().borrow().heartbeat_ms.max(500),
         bucket.refill_interval_ms.get().max(10),
     ));
+    coordinator.log(&format!(
+        "phase_d_summary effective_connection_budget={} configured_connection_budget={} next_phi_ratio={:.3}",
+        engine.effective_connection_budget.get(),
+        engine.configured_connection_budget.get(),
+        engine.max_ratio_for_next_download.get(),
+    ));
 
     match control.halt_mode() {
         HaltMode::Running => {
@@ -1419,6 +1493,7 @@ impl Coordinator {
         schedule_mode: ScheduleMode,
         metrics: Rc<SchedulerMetrics>,
         adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
+        phi_max_ratio: f64,
     ) -> Result<Self> {
         let fib_mb = build_fib_mb();
         let ceil_mb = total_size.div_ceil(MB);
@@ -1429,7 +1504,7 @@ impl Coordinator {
 
         let seed_ranges = match schedule_mode {
             ScheduleMode::FibAdaptive => {
-                build_phi_geometric_ranges(total_size, connections.max(1), INITIAL_PHI_MAX_RATIO, STORAGE_BLOCK_SIZE)
+                build_phi_geometric_ranges(total_size, connections.max(1), phi_max_ratio, STORAGE_BLOCK_SIZE)
             }
             ScheduleMode::Fib => {
                 let seed_start_idx = choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
@@ -1482,7 +1557,7 @@ impl Coordinator {
         };
 
         coordinator.log(&format!(
-            "Coordinator started for task={} total_size={}B ceil_mb={} schedule_mode={} seed_floor_mb={} seed_start={}MB support_end={}MB borrow_limit={}MB dry_run={} index_state_bucket_mb={} index_state_buckets={} index_state_bytes={}",
+            "Coordinator started for task={} total_size={}B ceil_mb={} schedule_mode={} seed_floor_mb={} seed_start={}MB support_end={}MB borrow_limit={}MB dry_run={} phi_max_ratio={:.3} index_state_bucket_mb={} index_state_buckets={} index_state_bytes={}",
             task_id,
             total_size,
             ceil_mb,
@@ -1492,6 +1567,7 @@ impl Coordinator {
             fib_mb[support_idx],
             borrow_limit_mb.max(1),
             dry_run,
+            phi_max_ratio,
             INDEX_STATE_MB,
             coordinator.index_state.bucket_count(),
             coordinator.index_state.storage_bytes(),
@@ -3109,6 +3185,38 @@ fn compute_refill_interval_ms(global_bandwidth_limit_bps: u64) -> u64 {
     ((256_u64 * 1024).saturating_mul(1000) / global_bandwidth_limit_bps.max(1)).clamp(10, 100)
 }
 
+fn compute_effective_connection_budget(configured_budget: usize, available_mb: u64) -> usize {
+    let configured_min = configured_budget.min(2).max(1);
+    if available_mb < 256 {
+        configured_min.max(configured_budget / 4)
+    } else if available_mb < 512 {
+        configured_min.max(configured_budget / 2)
+    } else if available_mb < 1024 {
+        configured_min.max(configured_budget.saturating_mul(3) / 4)
+    } else {
+        configured_budget
+    }
+}
+
+fn compute_connection_cv(samples: &[f64]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    if mean < 1.0 {
+        return None;
+    }
+    let variance = samples
+        .iter()
+        .map(|sample| {
+            let delta = *sample - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    Some((variance.sqrt() / mean).max(0.0))
+}
+
 async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
     let now = Instant::now();
     if now.duration_since(scaler.last_reuse_reset.get()) >= Duration::from_secs(60) {
@@ -3354,4 +3462,26 @@ fn persist_snapshot(path: &Path, snapshot: &TaskSnapshot) -> Result<()> {
 fn load_snapshot(path: &Path) -> Result<TaskSnapshot> {
     let bytes = std::fs::read(path)?;
     Ok(bincode::deserialize(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_scales_by_available_memory() {
+        assert_eq!(compute_effective_connection_budget(32, 2048), 32);
+        assert_eq!(compute_effective_connection_budget(32, 900), 24);
+        assert_eq!(compute_effective_connection_budget(32, 400), 16);
+        assert_eq!(compute_effective_connection_budget(32, 200), 8);
+        assert_eq!(compute_effective_connection_budget(1, 200), 1);
+    }
+
+    #[test]
+    fn connection_cv_requires_meaningful_samples() {
+        assert!(compute_connection_cv(&[]).is_none());
+        assert!(compute_connection_cv(&[0.0, 0.0]).is_none());
+        let cv = compute_connection_cv(&[100.0, 100.0, 200.0, 200.0]).unwrap();
+        assert!(cv > 0.0);
+    }
 }
