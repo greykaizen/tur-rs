@@ -40,7 +40,7 @@ const RETRY_BASE_DELAY_MS: u64 = 250;
 const RETRY_MAX_DELAY_MS: u64 = 2_000;
 const DRY_RUN_STEP_BYTES: u64 = 256 * 1024;
 const DRY_RUN_STEP_DELAY_MS: u64 = 4;
-const WRITE_BUFFER_MIN_BYTES: usize = 64 * 1024;
+const WRITE_BUFFER_MIN_BYTES: usize = 128 * 1024;
 const WRITE_BUFFER_MEDIUM_BYTES: usize = 256 * 1024;
 const WRITE_BUFFER_LARGE_BYTES: usize = 512 * 1024;
 const WRITE_BUFFER_MAX_BYTES: usize = MB as usize;
@@ -258,6 +258,8 @@ struct SchedulerMetrics {
     adaptive_min_steal_bytes_final: Cell<u64>,
     adaptive_heartbeat_ms_final: Cell<u64>,
     adaptive_refill_interval_ms_final: Cell<u64>,
+    max_write_buffer_target_bytes: Cell<u64>,
+    max_ewma_write_latency_x10: Cell<u64>,
 }
 
 impl SchedulerMetrics {
@@ -460,7 +462,8 @@ pub struct DownloadEngine {
     pub global_bandwidth_limit: Cell<u64>,
     pub refill_interval_ms: Cell<u64>,
     pub last_memory_check: Cell<Instant>,
-    pub max_ratio_for_next_download: Cell<f64>,
+    pub origin_phi_ratios: RefCell<HashMap<String, f64>>,
+    pub write_buffer_cap_bytes: Rc<Cell<usize>>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
 
@@ -636,7 +639,8 @@ impl DownloadEngine {
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
             refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
             last_memory_check: Cell::new(Instant::now()),
-            max_ratio_for_next_download: Cell::new(INITIAL_PHI_MAX_RATIO),
+            origin_phi_ratios: RefCell::new(HashMap::new()),
+            write_buffer_cap_bytes: Rc::new(Cell::new(4 * MB as usize)),
             downloads: RefCell::new(Vec::new()),
         })
     }
@@ -683,6 +687,12 @@ impl DownloadEngine {
                         let previous_effective = self.effective_connection_budget.get();
                         let new_effective =
                             compute_effective_connection_budget(configured_budget, available_mb);
+                        let write_buffer_cap_bytes = if available_mb < 512 {
+                            WRITE_BUFFER_LARGE_BYTES
+                        } else {
+                            4 * MB as usize
+                        };
+                        self.write_buffer_cap_bytes.set(write_buffer_cap_bytes);
                         if new_effective != previous_effective {
                             let current_available = self.connection_budget.get().min(previous_effective);
                             let active_leases = previous_effective.saturating_sub(current_available);
@@ -963,7 +973,14 @@ async fn run_download_task_local(
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
-    let phi_max_ratio = engine.max_ratio_for_next_download.get();
+    let origin = origin_key(&task.url);
+    let phi_max_ratio = engine
+        .origin_phi_ratios
+        .borrow()
+        .get(&origin)
+        .copied()
+        .unwrap_or(INITIAL_PHI_MAX_RATIO);
+    let write_buffer_cap_bytes = engine.write_buffer_cap_bytes.clone();
     let adaptive_minimum_steal_bytes = Rc::new(Cell::new(
         (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
     ));
@@ -1079,7 +1096,9 @@ async fn run_download_task_local(
             dry_run: task.dry_run,
             borrow_limit_bytes: task.borrow_limit_mb * MB,
             adaptive_minimum_steal_bytes: adaptive_minimum_steal_bytes.clone(),
+            write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
             total_size,
+            ewma_write_latency_ms: Cell::new(10.0),
             metrics: metrics.clone(),
             client: http_client.clone(),
             index_state: index_state.clone(),
@@ -1111,6 +1130,7 @@ async fn run_download_task_local(
     let scaler_borrow_limit = task.borrow_limit_mb * MB;
     let scaler_adaptive_minimum_steal_bytes = adaptive_minimum_steal_bytes.clone();
     let scaler_dry_run = task.dry_run;
+    let scaler_origin = origin.clone();
     let mut connection_id_counter = initial_connections as u32;
     let mut worker_history: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut phi_ratio_recorded = false;
@@ -1206,7 +1226,10 @@ async fn run_download_task_local(
                 if !phi_ratio_recorded {
                     if let Some(cv_connections) = compute_connection_cv(&connection_speeds) {
                         let next_phi_ratio = (1.0 + cv_connections).clamp(1.1, 2.5);
-                        scaler_engine.max_ratio_for_next_download.set(next_phi_ratio);
+                        scaler_engine
+                            .origin_phi_ratios
+                            .borrow_mut()
+                            .insert(scaler_origin.clone(), next_phi_ratio);
                         phi_ratio_recorded = true;
                         log_phase_a_info(
                             &scaler_log_path,
@@ -1309,7 +1332,9 @@ async fn run_download_task_local(
                     dry_run: scaler_dry_run,
                     borrow_limit_bytes: scaler_borrow_limit,
                     adaptive_minimum_steal_bytes: scaler_adaptive_minimum_steal_bytes.clone(),
+                    write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
                     total_size,
+                    ewma_write_latency_ms: Cell::new(10.0),
                     metrics: scaler_metrics.clone(),
                     client: scaler_http_client.clone(),
                     index_state: scaler_index_state.clone(),
@@ -1427,7 +1452,18 @@ async fn run_download_task_local(
         "phase_d_summary effective_connection_budget={} configured_connection_budget={} next_phi_ratio={:.3}",
         engine.effective_connection_budget.get(),
         engine.configured_connection_budget.get(),
-        engine.max_ratio_for_next_download.get(),
+        engine
+            .origin_phi_ratios
+            .borrow()
+            .get(&origin)
+            .copied()
+            .unwrap_or(INITIAL_PHI_MAX_RATIO),
+    ));
+    coordinator.log(&format!(
+        "phase_e_summary write_buffer_cap_bytes={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
+        engine.write_buffer_cap_bytes.get(),
+        metrics.max_write_buffer_target_bytes.get(),
+        metrics.max_ewma_write_latency_x10.get() as f64 / 10.0,
     ));
 
     match control.halt_mode() {
@@ -1973,7 +2009,9 @@ struct ConnectionWorker {
     dry_run: bool,
     borrow_limit_bytes: u64,
     adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
+    write_buffer_cap_bytes: Rc<Cell<usize>>,
     total_size: u64,
+    ewma_write_latency_ms: Cell<f64>,
     metrics: Rc<SchedulerMetrics>,
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
@@ -2203,6 +2241,17 @@ impl ConnectionWorker {
 
         let write_ms = write_started.elapsed().as_millis() as u64;
         attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
+        if write_ms > 0 && write_ms <= 500 {
+            let sample = write_ms as f64;
+            let prev = self.ewma_write_latency_ms.get();
+            let updated = 0.2 * sample + 0.8 * prev;
+            self.ewma_write_latency_ms.set(updated);
+            let max_x10 = self.metrics.max_ewma_write_latency_x10.get();
+            let updated_x10 = (updated * 10.0).round() as u64;
+            if updated_x10 > max_x10 {
+                self.metrics.max_ewma_write_latency_x10.set(updated_x10);
+            }
+        }
         
         self.trim_pending_write(pending);
         Ok(())
@@ -2217,7 +2266,7 @@ impl ConnectionWorker {
 
     fn target_write_buffer_bytes(&self, recent_speed_bps: f64) -> usize {
         let speed_bps = recent_speed_bps.max(0.0) as u64;
-        if speed_bps >= WRITE_BUFFER_MAX_SPEED_BPS {
+        let speed_target = if speed_bps >= WRITE_BUFFER_MAX_SPEED_BPS {
             WRITE_BUFFER_MAX_BYTES
         } else if speed_bps >= WRITE_BUFFER_LARGE_SPEED_BPS {
             WRITE_BUFFER_LARGE_BYTES
@@ -2225,11 +2274,25 @@ impl ConnectionWorker {
             WRITE_BUFFER_MEDIUM_BYTES
         } else {
             WRITE_BUFFER_MIN_BYTES
+        };
+        let latency_ratio = (self.ewma_write_latency_ms.get() / 10.0).max(1.0);
+        let latency_target = ((WRITE_BUFFER_LARGE_BYTES as f64) * latency_ratio).round() as usize;
+        let cap = self.write_buffer_cap_bytes.get().max(WRITE_BUFFER_LARGE_BYTES);
+        speed_target
+            .max(latency_target)
+            .clamp(WRITE_BUFFER_MIN_BYTES, cap)
+    }
+
+    fn record_write_buffer_target_metric(&self, target: usize) {
+        let target_u64 = target as u64;
+        if target_u64 > self.metrics.max_write_buffer_target_bytes.get() {
+            self.metrics.max_write_buffer_target_bytes.set(target_u64);
         }
     }
 
     fn update_pending_write_target(&self, pending: &mut PendingWrite, recent_speed_bps: f64) {
         let target = self.target_write_buffer_bytes(recent_speed_bps);
+        self.record_write_buffer_target_metric(target);
         if pending.target_bytes == 0 {
             pending.target_bytes = target;
         } else {
@@ -3217,6 +3280,16 @@ fn compute_connection_cv(samples: &[f64]) -> Option<f64> {
     Some((variance.sqrt() / mean).max(0.0))
 }
 
+fn origin_key(url: &str) -> String {
+    if let Ok(parsed) = Url::parse(url) {
+        let scheme = parsed.scheme();
+        let host = parsed.host_str().unwrap_or(url);
+        let port = parsed.port_or_known_default().unwrap_or_default();
+        return format!("{scheme}://{host}:{port}");
+    }
+    url.to_string()
+}
+
 async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
     let now = Instant::now();
     if now.duration_since(scaler.last_reuse_reset.get()) >= Duration::from_secs(60) {
@@ -3483,5 +3556,12 @@ mod tests {
         assert!(compute_connection_cv(&[0.0, 0.0]).is_none());
         let cv = compute_connection_cv(&[100.0, 100.0, 200.0, 200.0]).unwrap();
         assert!(cv > 0.0);
+    }
+
+    #[test]
+    fn origin_key_normalizes_scheme_host_and_port() {
+        assert_eq!(origin_key("https://example.com/path"), "https://example.com:443");
+        assert_eq!(origin_key("http://example.com/test"), "http://example.com:80");
+        assert_eq!(origin_key("not a url"), "not a url");
     }
 }
