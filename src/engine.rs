@@ -1010,6 +1010,8 @@ async fn run_download_task_local(
             worker_control: worker_control.clone(),
             dry_run: task.dry_run,
             borrow_limit_bytes: task.borrow_limit_mb * MB,
+            adaptive_minimum_steal_bytes: adaptive_minimum_steal_bytes.clone(),
+            total_size,
             metrics: metrics.clone(),
             client: http_client.clone(),
             index_state: index_state.clone(),
@@ -1212,6 +1214,8 @@ async fn run_download_task_local(
                     worker_control: worker_control.clone(),
                     dry_run: scaler_dry_run,
                     borrow_limit_bytes: scaler_borrow_limit,
+                    adaptive_minimum_steal_bytes: scaler_adaptive_minimum_steal_bytes.clone(),
+                    total_size,
                     metrics: scaler_metrics.clone(),
                     client: scaler_http_client.clone(),
                     index_state: scaler_index_state.clone(),
@@ -1807,15 +1811,15 @@ impl Coordinator {
         } else {
             self.borrow_limit_bytes
         };
-        base_limit.max(self.adaptive_minimum_steal_bytes.get())
+        if self.is_tail_phase() {
+            base_limit
+        } else {
+            base_limit.max(self.adaptive_minimum_steal_bytes.get())
+        }
     }
 
     fn is_tail_phase(&self) -> bool {
-        if self.total_size == 0 {
-            return false;
-        }
-        let completed = snapshot_downloaded(self, self.total_size);
-        completed.saturating_mul(100) >= self.total_size.saturating_mul(95)
+        is_tail_phase_bytes(snapshot_downloaded(self, self.total_size), self.total_size)
     }
 
     fn snapshot(&self) -> CoordinatorSnapshot {
@@ -1855,6 +1859,8 @@ struct ConnectionWorker {
     worker_control: Rc<WorkerControl>,
     dry_run: bool,
     borrow_limit_bytes: u64,
+    adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
+    total_size: u64,
     metrics: Rc<SchedulerMetrics>,
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
@@ -1899,6 +1905,20 @@ enum RequestKind {
 }
 
 impl ConnectionWorker {
+    fn effective_prefetch_limit_bytes(&self) -> u64 {
+        let base_limit = if is_tail_phase_bytes(self.global_downloaded.get(), self.total_size) {
+            self.borrow_limit_bytes.min(MB).max(MB)
+        } else {
+            self.borrow_limit_bytes
+        };
+
+        if is_tail_phase_bytes(self.global_downloaded.get(), self.total_size) {
+            base_limit
+        } else {
+            base_limit.max(self.adaptive_minimum_steal_bytes.get())
+        }
+    }
+
     fn should_exit_for_scale_down(&self) -> bool {
         self.worker_control.stop_requested.get()
     }
@@ -2231,7 +2251,11 @@ impl ConnectionWorker {
             let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
 
             let remaining = end.saturating_sub(new_pos);
-            if should_prefetch(remaining, recent_speed_bps, self.borrow_limit_bytes)
+            if should_prefetch(
+                remaining,
+                recent_speed_bps,
+                self.effective_prefetch_limit_bytes(),
+            )
                 && prefetch_handle.is_none()
                 && prefetched_range.is_none()
                 && !no_more_work_hint
@@ -2518,7 +2542,11 @@ impl ConnectionWorker {
                 }
 
                 let remaining = max_end.saturating_sub(new_pos);
-                if should_prefetch(remaining, recent_speed_bps, self.borrow_limit_bytes)
+                if should_prefetch(
+                    remaining,
+                    recent_speed_bps,
+                    self.effective_prefetch_limit_bytes(),
+                )
                     && prefetch_handle.is_none()
                     && prefetched_range.is_none()
                     && !no_more_work_hint
@@ -2791,6 +2819,14 @@ fn snapshot_downloaded(coordinator: &Coordinator, total_size: u64) -> u64 {
         .sum::<u64>();
 
     downloaded.min(total_size)
+}
+
+fn is_tail_phase_bytes(downloaded: u64, total_size: u64) -> bool {
+    if total_size == 0 {
+        return false;
+    }
+
+    downloaded.saturating_mul(100) >= total_size.saturating_mul(95)
 }
 
 fn build_fib_mb() -> Vec<u64> {
