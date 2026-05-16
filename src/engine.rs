@@ -255,12 +255,14 @@ struct SchedulerMetrics {
     fresh_handshake_ms: Cell<u64>,
     skipped_growth_samples: Cell<u64>,
     adaptive_min_steal_bytes_final: Cell<u64>,
+    adaptive_heartbeat_ms_final: Cell<u64>,
+    adaptive_refill_interval_ms_final: Cell<u64>,
 }
 
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -290,6 +292,8 @@ impl SchedulerMetrics {
             self.fresh_handshake_ms.get(),
             self.skipped_growth_samples.get(),
             self.adaptive_min_steal_bytes_final.get(),
+            self.adaptive_heartbeat_ms_final.get(),
+            self.adaptive_refill_interval_ms_final.get(),
         )
     }
 
@@ -318,6 +322,7 @@ impl Default for ScalerConfig {
 pub struct TokenBucket {
     pub quota_bytes_per_sec: Cell<u64>,
     pub tokens: Cell<i64>,
+    pub refill_interval_ms: Cell<u64>,
 }
 
 impl TokenBucket {
@@ -325,6 +330,7 @@ impl TokenBucket {
         Self {
             quota_bytes_per_sec: Cell::new(0),
             tokens: Cell::new(0),
+            refill_interval_ms: Cell::new(100),
         }
     }
 
@@ -449,6 +455,7 @@ pub struct DownloadEngine {
     pub max_concurrent_tasks: usize,
     pub connection_budget: Cell<usize>,
     pub global_bandwidth_limit: Cell<u64>,
+    pub refill_interval_ms: Cell<u64>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
 
@@ -619,6 +626,7 @@ impl DownloadEngine {
             max_concurrent_tasks,
             connection_budget: Cell::new(max_total_connections.max(1)),
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
+            refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
             downloads: RefCell::new(Vec::new()),
         })
     }
@@ -647,12 +655,14 @@ impl DownloadEngine {
         let mut paused_tasks: HashMap<Uuid, TaskSnapshot> = HashMap::new();
         let mut persisted_paths: HashMap<Uuid, PathBuf> = HashMap::new();
         let mut pending_launches = VecDeque::<PendingLaunch>::new();
-
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut last_refill_recompute = Instant::now();
 
         loop {
+            let refill_sleep_ms = self.refill_interval_ms.get().max(10);
+            let refill_sleep = tokio::time::sleep(Duration::from_millis(refill_sleep_ms));
+            tokio::pin!(refill_sleep);
             tokio::select! {
-                _ = tick.tick() => {
+                _ = &mut refill_sleep => {
                     while active_controls.len() < self.max_concurrent_tasks {
                         let Some(next_launch) = pending_launches.pop_front() else { break; };
                         match next_launch {
@@ -698,6 +708,12 @@ impl DownloadEngine {
                     let n_active = downloads.len();
                     if n_active > 0 {
                         let global_limit = self.global_bandwidth_limit.get();
+                        if last_refill_recompute.elapsed() >= Duration::from_secs(5) {
+                            self.refill_interval_ms
+                                .set(compute_refill_interval_ms(global_limit));
+                            last_refill_recompute = Instant::now();
+                        }
+                        let refill_interval_ms = self.refill_interval_ms.get();
                         let per_download = if global_limit == 0 {
                             0
                         } else {
@@ -712,8 +728,13 @@ impl DownloadEngine {
                                 per_download.min(handle.per_download_limit_bps)
                             };
                             handle.bucket.quota_bytes_per_sec.set(quota);
-                            handle.bucket.refill(100);
+                            handle.bucket.refill_interval_ms.set(refill_interval_ms);
+                            handle.bucket.refill(refill_interval_ms);
                         }
+                    } else if last_refill_recompute.elapsed() >= Duration::from_secs(5) {
+                        self.refill_interval_ms
+                            .set(compute_refill_interval_ms(self.global_bandwidth_limit.get()));
+                        last_refill_recompute = Instant::now();
                     }
                 }
                 cmd_opt = cmd_rx.recv() => {
@@ -1049,10 +1070,10 @@ async fn run_download_task_local(
     let scaler_for_task = scaler.clone();
     let scaler_task = tokio::task::spawn_local(async move {
         let mut last_downloaded = scaler_global_downloaded.get();
-        let mut tick = tokio::time::interval(Duration::from_millis(scaler_for_task.config.borrow().heartbeat_ms));
+        let mut heartbeat_ms_for_tick = scaler_for_task.config.borrow().heartbeat_ms.max(500);
         
         loop {
-            tick.tick().await;
+            tokio::time::sleep(Duration::from_millis(heartbeat_ms_for_tick)).await;
             if scaler_control.is_halted() || scaler_global_downloaded.get() >= total_size {
                 break;
             }
@@ -1061,8 +1082,8 @@ async fn run_download_task_local(
             let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
             last_downloaded = current_downloaded;
 
-            let heartbeat_ms = scaler_for_task.config.borrow().heartbeat_ms.max(1);
-            let interval_secs = heartbeat_ms as f64 / 1000.0;
+            let heartbeat_ms_prev = heartbeat_ms_for_tick;
+            let interval_secs = heartbeat_ms_prev as f64 / 1000.0;
             let current_throughput = downloaded_in_tick as f64 / interval_secs;
             let (alpha, _cv) = update_scaler_signal_stats(&scaler_for_task, current_throughput);
             let skip_growth_sample = scaler_for_task.skip_growth_sample.replace(false);
@@ -1079,7 +1100,10 @@ async fn run_download_task_local(
                 scaler_for_task.ewma_throughput.set(updated);
                 updated
             };
-            let bytes_per_heartbeat = new_ewma * interval_secs;
+            let next_heartbeat_ms = compute_heartbeat_ms(&scaler_for_task);
+            scaler_for_task.config.borrow_mut().heartbeat_ms = next_heartbeat_ms;
+            heartbeat_ms_for_tick = next_heartbeat_ms;
+            let bytes_per_heartbeat = new_ewma * (next_heartbeat_ms as f64 / 1000.0);
             let adaptive_min_steal_bytes =
                 ((bytes_per_heartbeat / 4.0).round() as u64).max(2 * STORAGE_BLOCK_SIZE);
             scaler_adaptive_minimum_steal_bytes.set(adaptive_min_steal_bytes);
@@ -1136,7 +1160,7 @@ async fn run_download_task_local(
             log_phase_a_info(
                 &scaler_log_path,
                 &format!(
-                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} adaptive_min_steal_bytes={}",
+                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} adaptive_min_steal_bytes={} heartbeat_ms_prev={} heartbeat_ms_next={}",
                     new_ewma,
                     scaler_for_task.alpha.get(),
                     scaler_for_task.cv.get(),
@@ -1147,6 +1171,8 @@ async fn run_download_task_local(
                     scaler_for_task.effective_add_threshold.get(),
                     scaler_for_task.slow_start_remaining.get(),
                     adaptive_min_steal_bytes,
+                    heartbeat_ms_prev,
+                    next_heartbeat_ms,
                 ),
             )
             .await;
@@ -1306,6 +1332,12 @@ async fn run_download_task_local(
 
     let _ = progress_handle.await;
 
+    metrics
+        .adaptive_heartbeat_ms_final
+        .set(control.scaler_config().borrow().heartbeat_ms.max(500));
+    metrics
+        .adaptive_refill_interval_ms_final
+        .set(bucket.refill_interval_ms.get().max(10));
     coordinator.log_summary(total_size);
     coordinator.log(&format!(
         "phase_a_summary alpha={:.3} cv={:.3} ewma_rtt_ms={:.1} ewma_handshake_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} reused_rtt_samples={}",
@@ -1317,6 +1349,11 @@ async fn run_download_task_local(
         scaler.effective_add_threshold.get(),
         scaler.slow_start_remaining.get(),
         scaler.reused_rtt_samples.get(),
+    ));
+    coordinator.log(&format!(
+        "phase_c_summary heartbeat_ms={} refill_interval_ms={}",
+        control.scaler_config().borrow().heartbeat_ms.max(500),
+        bucket.refill_interval_ms.get().max(10),
     ));
 
     match control.halt_mode() {
@@ -3057,6 +3094,19 @@ fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>) -> u32 {
     let heartbeat_ms = scaler.config.borrow().heartbeat_ms.max(1) as f64;
     let estimated_ms = scaler.ewma_rtt_ms.get() * 12.0;
     ((estimated_ms / heartbeat_ms).ceil() as u32).clamp(1, 4)
+}
+
+fn compute_heartbeat_ms(scaler: &Rc<Scaler>) -> u64 {
+    let cv = scaler.cv.get().max(0.0);
+    ((500.0 + (cv * 2500.0)).round() as u64).clamp(500, 3000)
+}
+
+fn compute_refill_interval_ms(global_bandwidth_limit_bps: u64) -> u64 {
+    if global_bandwidth_limit_bps == 0 {
+        return 50;
+    }
+
+    ((256_u64 * 1024).saturating_mul(1000) / global_bandwidth_limit_bps.max(1)).clamp(10, 100)
 }
 
 async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
