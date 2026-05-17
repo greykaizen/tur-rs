@@ -4,3 +4,4 @@ target/
 tasks/
 
 benchmarks/
+graphify-out/

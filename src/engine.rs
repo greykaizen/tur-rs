@@ -51,6 +51,7 @@ const HTTP2_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const HTTP2_MAX_FRAME_BYTES: u32 = 256 * 1024;
 const HTTP2_MAX_SEND_BUFFER_BYTES: usize = 2 * MB as usize;
+const ORIGIN_PHI_RATIO_CAPACITY: usize = 256;
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
@@ -265,7 +266,7 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -297,6 +298,8 @@ impl SchedulerMetrics {
             self.adaptive_min_steal_bytes_final.get(),
             self.adaptive_heartbeat_ms_final.get(),
             self.adaptive_refill_interval_ms_final.get(),
+            self.max_write_buffer_target_bytes.get(),
+            self.max_ewma_write_latency_x10.get() as f64 / 10.0,
         )
     }
 
@@ -453,6 +456,70 @@ struct WorkerSlot {
     handle: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OriginPhiRatioEntry {
+    ratio: f64,
+    last_used_tick: u64,
+}
+
+#[derive(Debug, Default)]
+struct OriginPhiRatioStore {
+    entries: HashMap<String, OriginPhiRatioEntry>,
+    usage_tick: u64,
+}
+
+impl OriginPhiRatioStore {
+    fn next_tick(&mut self) -> u64 {
+        self.usage_tick = self.usage_tick.saturating_add(1);
+        self.usage_tick
+    }
+
+    fn ratio_for_origin(&mut self, origin: &str) -> f64 {
+        let tick = self.next_tick();
+        if let Some(entry) = self.entries.get_mut(origin) {
+            entry.last_used_tick = tick;
+            entry.ratio
+        } else {
+            INITIAL_PHI_MAX_RATIO
+        }
+    }
+
+    fn update_origin_ratio(&mut self, origin: String, ratio: f64) {
+        let tick = self.next_tick();
+        self.entries.insert(
+            origin,
+            OriginPhiRatioEntry {
+                ratio,
+                last_used_tick: tick,
+            },
+        );
+        self.prune_lru();
+    }
+
+    fn current_ratio(&self, origin: &str) -> Option<f64> {
+        self.entries.get(origin).map(|entry| entry.ratio)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn prune_lru(&mut self) {
+        while self.entries.len() > ORIGIN_PHI_RATIO_CAPACITY {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick)
+                .map(|(origin, _)| origin.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&lru_key);
+        }
+    }
+}
+
 pub struct DownloadEngine {
     pub connections_per_download: usize,
     pub max_concurrent_tasks: usize,
@@ -462,7 +529,7 @@ pub struct DownloadEngine {
     pub global_bandwidth_limit: Cell<u64>,
     pub refill_interval_ms: Cell<u64>,
     pub last_memory_check: Cell<Instant>,
-    pub origin_phi_ratios: RefCell<HashMap<String, f64>>,
+    origin_phi_ratios: RefCell<OriginPhiRatioStore>,
     pub write_buffer_cap_bytes: Rc<Cell<usize>>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
@@ -639,7 +706,7 @@ impl DownloadEngine {
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
             refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
             last_memory_check: Cell::new(Instant::now()),
-            origin_phi_ratios: RefCell::new(HashMap::new()),
+            origin_phi_ratios: RefCell::new(OriginPhiRatioStore::default()),
             write_buffer_cap_bytes: Rc::new(Cell::new(4 * MB as usize)),
             downloads: RefCell::new(Vec::new()),
         })
@@ -974,12 +1041,8 @@ async fn run_download_task_local(
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
     let origin = origin_key(&task.url);
-    let phi_max_ratio = engine
-        .origin_phi_ratios
-        .borrow()
-        .get(&origin)
-        .copied()
-        .unwrap_or(INITIAL_PHI_MAX_RATIO);
+    let phi_max_ratio = engine.origin_phi_ratios.borrow_mut().ratio_for_origin(&origin);
+    let shared_write_latency_ms = Rc::new(Cell::new(10.0));
     let write_buffer_cap_bytes = engine.write_buffer_cap_bytes.clone();
     let adaptive_minimum_steal_bytes = Rc::new(Cell::new(
         (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
@@ -1098,7 +1161,7 @@ async fn run_download_task_local(
             adaptive_minimum_steal_bytes: adaptive_minimum_steal_bytes.clone(),
             write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
             total_size,
-            ewma_write_latency_ms: Cell::new(10.0),
+            shared_write_latency_ms: shared_write_latency_ms.clone(),
             metrics: metrics.clone(),
             client: http_client.clone(),
             index_state: index_state.clone(),
@@ -1229,7 +1292,7 @@ async fn run_download_task_local(
                         scaler_engine
                             .origin_phi_ratios
                             .borrow_mut()
-                            .insert(scaler_origin.clone(), next_phi_ratio);
+                            .update_origin_ratio(scaler_origin.clone(), next_phi_ratio);
                         phi_ratio_recorded = true;
                         log_phase_a_info(
                             &scaler_log_path,
@@ -1334,7 +1397,7 @@ async fn run_download_task_local(
                     adaptive_minimum_steal_bytes: scaler_adaptive_minimum_steal_bytes.clone(),
                     write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
                     total_size,
-                    ewma_write_latency_ms: Cell::new(10.0),
+                    shared_write_latency_ms: shared_write_latency_ms.clone(),
                     metrics: scaler_metrics.clone(),
                     client: scaler_http_client.clone(),
                     index_state: scaler_index_state.clone(),
@@ -1455,8 +1518,7 @@ async fn run_download_task_local(
         engine
             .origin_phi_ratios
             .borrow()
-            .get(&origin)
-            .copied()
+            .current_ratio(&origin)
             .unwrap_or(INITIAL_PHI_MAX_RATIO),
     ));
     coordinator.log(&format!(
@@ -2011,7 +2073,7 @@ struct ConnectionWorker {
     adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     write_buffer_cap_bytes: Rc<Cell<usize>>,
     total_size: u64,
-    ewma_write_latency_ms: Cell<f64>,
+    shared_write_latency_ms: Rc<Cell<f64>>,
     metrics: Rc<SchedulerMetrics>,
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
@@ -2243,9 +2305,9 @@ impl ConnectionWorker {
         attempt_timing.write_ms = attempt_timing.write_ms.saturating_add(write_ms);
         if write_ms > 0 && write_ms <= 500 {
             let sample = write_ms as f64;
-            let prev = self.ewma_write_latency_ms.get();
+            let prev = self.shared_write_latency_ms.get();
             let updated = 0.2 * sample + 0.8 * prev;
-            self.ewma_write_latency_ms.set(updated);
+            self.shared_write_latency_ms.set(updated);
             let max_x10 = self.metrics.max_ewma_write_latency_x10.get();
             let updated_x10 = (updated * 10.0).round() as u64;
             if updated_x10 > max_x10 {
@@ -2275,7 +2337,7 @@ impl ConnectionWorker {
         } else {
             WRITE_BUFFER_MIN_BYTES
         };
-        let latency_ratio = (self.ewma_write_latency_ms.get() / 10.0).max(1.0);
+        let latency_ratio = (self.shared_write_latency_ms.get() / 10.0).max(1.0);
         let latency_target = ((WRITE_BUFFER_LARGE_BYTES as f64) * latency_ratio).round() as usize;
         let cap = self.write_buffer_cap_bytes.get().max(WRITE_BUFFER_LARGE_BYTES);
         speed_target
@@ -3563,5 +3625,22 @@ mod tests {
         assert_eq!(origin_key("https://example.com/path"), "https://example.com:443");
         assert_eq!(origin_key("http://example.com/test"), "http://example.com:80");
         assert_eq!(origin_key("not a url"), "not a url");
+    }
+
+    #[test]
+    fn origin_phi_ratio_store_prunes_least_recently_used_entries() {
+        let mut store = OriginPhiRatioStore::default();
+        for idx in 0..ORIGIN_PHI_RATIO_CAPACITY {
+            store.update_origin_ratio(format!("https://host{idx}.example:443"), 1.1);
+        }
+        assert_eq!(store.len(), ORIGIN_PHI_RATIO_CAPACITY);
+
+        let keep_key = "https://host0.example:443";
+        assert_eq!(store.ratio_for_origin(keep_key), 1.1);
+
+        store.update_origin_ratio("https://new.example:443".to_string(), 1.9);
+        assert_eq!(store.len(), ORIGIN_PHI_RATIO_CAPACITY);
+        assert_eq!(store.current_ratio(keep_key), Some(1.1));
+        assert_eq!(store.current_ratio("https://new.example:443"), Some(1.9));
     }
 }
