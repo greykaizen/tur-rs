@@ -47,10 +47,7 @@ const WRITE_BUFFER_MAX_BYTES: usize = MB as usize;
 const WRITE_BUFFER_MEDIUM_SPEED_BPS: u64 = MB;
 const WRITE_BUFFER_LARGE_SPEED_BPS: u64 = 3 * MB;
 const WRITE_BUFFER_MAX_SPEED_BPS: u64 = 6 * MB;
-const HTTP2_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
-const HTTP2_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const HTTP2_MAX_FRAME_BYTES: u32 = 256 * 1024;
-const HTTP2_MAX_SEND_BUFFER_BYTES: usize = 2 * MB as usize;
 const ORIGIN_PHI_RATIO_CAPACITY: usize = 256;
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 const GOLDEN_RATIO_NUM: u64 = 633;
@@ -135,6 +132,13 @@ impl HttpMode {
         }
     }
 
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +243,9 @@ struct SchedulerMetrics {
     prefetch_ready: Cell<u64>,
     prefetch_hits: Cell<u64>,
     http_requests: Cell<u64>,
+    http1_requests: Cell<u64>,
+    http2_requests: Cell<u64>,
+    http_other_requests: Cell<u64>,
     http_setup_ms: Cell<u64>,
     http_ttfb_ms: Cell<u64>,
     http_stream_ms: Cell<u64>,
@@ -254,8 +261,18 @@ struct SchedulerMetrics {
     startup_total_to_first_byte_ms: Cell<u64>,
     reused_requests: Cell<u64>,
     fresh_requests: Cell<u64>,
+    http1_reused_requests: Cell<u64>,
+    http1_fresh_requests: Cell<u64>,
+    http2_reused_requests: Cell<u64>,
+    http2_fresh_requests: Cell<u64>,
     fresh_handshake_ms: Cell<u64>,
+    http1_fresh_handshake_ms: Cell<u64>,
+    http2_fresh_handshake_ms: Cell<u64>,
     skipped_growth_samples: Cell<u64>,
+    http1_scale_adds: Cell<u64>,
+    http1_scale_drops: Cell<u64>,
+    http2_scale_adds: Cell<u64>,
+    http2_scale_drops: Cell<u64>,
     adaptive_min_steal_bytes_final: Cell<u64>,
     adaptive_heartbeat_ms_final: Cell<u64>,
     adaptive_refill_interval_ms_final: Cell<u64>,
@@ -266,7 +283,7 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} fresh_handshake_ms={} skipped_growth_samples={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -278,6 +295,9 @@ impl SchedulerMetrics {
             self.prefetch_ready.get(),
             self.prefetch_hits.get(),
             self.http_requests.get(),
+            self.http1_requests.get(),
+            self.http2_requests.get(),
+            self.http_other_requests.get(),
             self.http_setup_ms.get(),
             self.http_ttfb_ms.get(),
             self.http_stream_ms.get(),
@@ -293,8 +313,18 @@ impl SchedulerMetrics {
             self.startup_total_to_first_byte_ms.get(),
             self.reused_requests.get(),
             self.fresh_requests.get(),
+            self.http1_reused_requests.get(),
+            self.http1_fresh_requests.get(),
+            self.http2_reused_requests.get(),
+            self.http2_fresh_requests.get(),
             self.fresh_handshake_ms.get(),
+            self.http1_fresh_handshake_ms.get(),
+            self.http2_fresh_handshake_ms.get(),
             self.skipped_growth_samples.get(),
+            self.http1_scale_adds.get(),
+            self.http1_scale_drops.get(),
+            self.http2_scale_adds.get(),
+            self.http2_scale_drops.get(),
             self.adaptive_min_steal_bytes_final.get(),
             self.adaptive_heartbeat_ms_final.get(),
             self.adaptive_refill_interval_ms_final.get(),
@@ -369,6 +399,23 @@ pub enum ScalerAction {
     Hold,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProtocolFamily {
+    Http1,
+    Http2,
+    Other,
+}
+
+impl ProtocolFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+            Self::Other => "other",
+        }
+    }
+}
+
 pub struct Scaler {
     pub ewma_throughput: Cell<f64>,
     pub peak_efficiency: Cell<f64>,
@@ -392,6 +439,7 @@ pub struct Scaler {
     pub reused_rtt_samples: Cell<u64>,
     pub skip_growth_sample: Cell<bool>,
     pub reuse_health_low: Cell<bool>,
+    last_protocol: Cell<ProtocolFamily>,
 }
 
 impl Scaler {
@@ -423,8 +471,17 @@ impl Scaler {
             reused_rtt_samples: Cell::new(0),
             skip_growth_sample: Cell::new(false),
             reuse_health_low: Cell::new(false),
+            last_protocol: Cell::new(ProtocolFamily::Other),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientTuning {
+    expected_concurrency: usize,
+    http2_stream_window_bytes: u32,
+    http2_connection_window_bytes: u32,
+    http2_max_send_buffer_bytes: usize,
 }
 
 pub struct DownloadHandle {
@@ -1092,12 +1149,11 @@ async fn run_download_task_local(
         }
     }
 
-    let (work_tx, work_rx) = mpsc::channel(128);
-    let http_client = build_http_client(task.http_mode);
-
     let min_connections = task.min_connections.max(1).min(task.max_connections.max(1));
     let max_connections = task.max_connections.max(min_connections);
     task.connections = task.connections.clamp(min_connections, max_connections);
+    let (work_tx, work_rx) = mpsc::channel(128);
+    let (http_client, client_tuning) = build_http_client(task.http_mode, max_connections);
 
     let scaler_config = ScalerConfig {
         min_connections,
@@ -1231,14 +1287,25 @@ async fn run_download_task_local(
                 scaler_for_task.ewma_throughput.set(updated);
                 updated
             };
+            let dominant_protocol =
+                dominant_protocol_from_metrics(&scaler_metrics, scaler_for_task.last_protocol.get());
             let next_heartbeat_ms = compute_heartbeat_ms(&scaler_for_task);
             scaler_for_task.config.borrow_mut().heartbeat_ms = next_heartbeat_ms;
             heartbeat_ms_for_tick = next_heartbeat_ms;
             let bytes_per_heartbeat = new_ewma * interval_secs;
-            let adaptive_min_steal_bytes =
-                ((bytes_per_heartbeat / 4.0).round() as u64).max(2 * STORAGE_BLOCK_SIZE);
+            let adaptive_min_steal_bytes = compute_protocol_aware_steal_floor_bytes(
+                dominant_protocol,
+                scaler_for_task.reuse_rate.get(),
+                bytes_per_heartbeat,
+            );
             scaler_adaptive_minimum_steal_bytes.set(adaptive_min_steal_bytes);
-            update_reuse_health(&scaler_for_task, &scaler_url, &scaler_log_path).await;
+            update_reuse_health(
+                &scaler_for_task,
+                &scaler_url,
+                &scaler_log_path,
+                dominant_protocol,
+            )
+            .await;
 
             let n_active = scaler_for_task.n_active.get();
             if n_active == 0 {
@@ -1314,7 +1381,8 @@ async fn run_download_task_local(
             log_phase_a_info(
                 &scaler_log_path,
                 &format!(
-                    "heartbeat throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} adaptive_min_steal_bytes={} heartbeat_ms_prev={} heartbeat_ms_next={}",
+                    "heartbeat protocol={} throughput_bps={:.0} alpha={:.3} cv={:.3} n_active={} current_efficiency={:.0} peak_efficiency={:.0} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} adaptive_min_steal_bytes={} heartbeat_ms_prev={} heartbeat_ms_next={} http1_requests={} http2_requests={}",
+                    dominant_protocol.as_str(),
                     new_ewma,
                     scaler_for_task.alpha.get(),
                     scaler_for_task.cv.get(),
@@ -1327,6 +1395,8 @@ async fn run_download_task_local(
                     adaptive_min_steal_bytes,
                     heartbeat_ms_prev,
                     next_heartbeat_ms,
+                    scaler_metrics.http1_requests.get(),
+                    scaler_metrics.http2_requests.get(),
                 ),
             )
             .await;
@@ -1350,9 +1420,16 @@ async fn run_download_task_local(
                 if scaler_engine.request_connection() {
                     scaler_for_task.throughput_before_add.set(new_ewma);
                     did_add = true;
-                    scaler_for_task.slow_start_remaining.set(compute_slow_start_heartbeats(&scaler_for_task));
+                    scaler_for_task
+                        .slow_start_remaining
+                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol));
                     scaler_for_task.last_action.set(ScalerAction::Grow);
                     scaler_leased_connections.set(scaler_leased_connections.get() + 1);
+                    record_protocol_scale_metric(
+                        &scaler_metrics,
+                        dominant_protocol,
+                        ScalerAction::Grow,
+                    );
                 }
             }
 
@@ -1372,6 +1449,11 @@ async fn run_download_task_local(
                     scaler_leased_connections
                         .set(scaler_leased_connections.get().saturating_sub(1));
                     scaler_for_task.last_action.set(ScalerAction::Shrink);
+                    record_protocol_scale_metric(
+                        &scaler_metrics,
+                        dominant_protocol,
+                        ScalerAction::Shrink,
+                    );
                     log_phase_a_info(
                         &scaler_log_path,
                         &format!("scale_drop connection_id={} n_active={}", connection_id, scaler_for_task.n_active.get()),
@@ -1496,6 +1578,26 @@ async fn run_download_task_local(
         .set(bucket.refill_interval_ms.get().max(10));
     coordinator.log_summary(total_size);
     coordinator.log(&format!(
+        "phase_protocol_summary http_mode={} dominant_protocol={} http1_requests={} http2_requests={} http_other_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} h2_stream_window_bytes={} h2_connection_window_bytes={} h2_max_send_buffer_bytes={} expected_concurrency={}",
+        task.http_mode.as_str(),
+        dominant_protocol_from_metrics(&metrics, scaler.last_protocol.get()).as_str(),
+        metrics.http1_requests.get(),
+        metrics.http2_requests.get(),
+        metrics.http_other_requests.get(),
+        metrics.http1_reused_requests.get(),
+        metrics.http1_fresh_requests.get(),
+        metrics.http2_reused_requests.get(),
+        metrics.http2_fresh_requests.get(),
+        metrics.http1_scale_adds.get(),
+        metrics.http1_scale_drops.get(),
+        metrics.http2_scale_adds.get(),
+        metrics.http2_scale_drops.get(),
+        client_tuning.http2_stream_window_bytes,
+        client_tuning.http2_connection_window_bytes,
+        client_tuning.http2_max_send_buffer_bytes,
+        client_tuning.expected_concurrency,
+    ));
+    coordinator.log(&format!(
         "phase_a_summary alpha={:.3} cv={:.3} ewma_rtt_ms={:.1} ewma_handshake_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} reused_rtt_samples={}",
         scaler.alpha.get(),
         scaler.cv.get(),
@@ -1564,7 +1666,7 @@ async fn resolve_total_size(task: &DownloadTask) -> Result<u64> {
         }
     }
 
-    let client = build_http_client(task.http_mode);
+    let (client, _) = build_http_client(task.http_mode, task.max_connections.max(1));
     let res = send_request_follow_redirects(&client, Method::HEAD, &task.url, None).await?;
     let total_size = res
         .headers()
@@ -2090,6 +2192,7 @@ struct AttemptTiming {
     bytes_written: u64,
     chunks: u64,
     request_kind: Option<RequestKind>,
+    protocol: Option<ProtocolFamily>,
     handshake_cost_ms: u64,
 }
 
@@ -2191,6 +2294,7 @@ impl ConnectionWorker {
         &self,
         attempt_timing: &mut AttemptTiming,
         total_ttfb_ms: u64,
+        protocol: ProtocolFamily,
     ) {
         let was_growth_probe = self.worker_control.pending_growth_probe.replace(false);
         let ttfb_ms = total_ttfb_ms as f64;
@@ -2202,6 +2306,8 @@ impl ConnectionWorker {
             RequestKind::Fresh
         };
         attempt_timing.request_kind = Some(kind);
+        attempt_timing.protocol = Some(protocol);
+        self.scaler.last_protocol.set(protocol);
         self.scaler
             .total_request_count
             .set(self.scaler.total_request_count.get().saturating_add(1));
@@ -2222,6 +2328,15 @@ impl ConnectionWorker {
                     .reused_rtt_samples
                     .set(self.scaler.reused_rtt_samples.get().saturating_add(1));
                 SchedulerMetrics::add(&self.metrics.reused_requests, 1);
+                match protocol {
+                    ProtocolFamily::Http1 => {
+                        SchedulerMetrics::add(&self.metrics.http1_reused_requests, 1);
+                    }
+                    ProtocolFamily::Http2 => {
+                        SchedulerMetrics::add(&self.metrics.http2_reused_requests, 1);
+                    }
+                    ProtocolFamily::Other => {}
+                }
             }
             RequestKind::Fresh => {
                 let handshake_cost_ms = (ttfb_ms - ewma_rtt_ms.max(1.0)).max(0.0);
@@ -2234,15 +2349,36 @@ impl ConnectionWorker {
                     &self.metrics.fresh_handshake_ms,
                     attempt_timing.handshake_cost_ms,
                 );
+                match protocol {
+                    ProtocolFamily::Http1 => {
+                        SchedulerMetrics::add(&self.metrics.http1_fresh_requests, 1);
+                        SchedulerMetrics::add(
+                            &self.metrics.http1_fresh_handshake_ms,
+                            attempt_timing.handshake_cost_ms,
+                        );
+                    }
+                    ProtocolFamily::Http2 => {
+                        SchedulerMetrics::add(&self.metrics.http2_fresh_requests, 1);
+                        SchedulerMetrics::add(
+                            &self.metrics.http2_fresh_handshake_ms,
+                            attempt_timing.handshake_cost_ms,
+                        );
+                    }
+                    ProtocolFamily::Other => {}
+                }
 
                 if was_growth_probe
                     && self.scaler.last_action.get() == ScalerAction::Grow
-                    && self.scaler.reused_rtt_samples.get() >= MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD
+                    && self.scaler.reused_rtt_samples.get()
+                        >= protocol_growth_shield_min_samples(protocol)
                 {
                     self.scaler.skip_growth_sample.set(true);
                     let heartbeat_ms = self.scaler.config.borrow().heartbeat_ms.max(1);
+                    let adjusted_handshake_ms = ((attempt_timing.handshake_cost_ms as f64)
+                        * protocol_growth_shield_multiplier(protocol))
+                        .round() as u64;
                     let extra_heartbeats =
-                        ((attempt_timing.handshake_cost_ms + heartbeat_ms - 1) / heartbeat_ms) as u32;
+                        ((adjusted_handshake_ms + heartbeat_ms - 1) / heartbeat_ms) as u32;
                     self.scaler.slow_start_remaining.set(
                         self.scaler
                             .slow_start_remaining
@@ -2250,7 +2386,8 @@ impl ConnectionWorker {
                             .saturating_add(extra_heartbeats.max(1)),
                     );
                     self.log_msg(&format!(
-                        "growth_probe_shield handshake_ms={} extra_heartbeats={} reused_rtt_samples={}",
+                        "growth_probe_shield protocol={} handshake_ms={} extra_heartbeats={} reused_rtt_samples={}",
+                        protocol.as_str(),
                         attempt_timing.handshake_cost_ms,
                         extra_heartbeats.max(1),
                         self.scaler.reused_rtt_samples.get(),
@@ -2268,7 +2405,8 @@ impl ConnectionWorker {
         }
 
         self.log_msg(&format!(
-            "request_classified kind={:?} total_ttfb_ms={} ewma_rtt_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2}",
+            "request_classified protocol={} kind={:?} total_ttfb_ms={} ewma_rtt_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2}",
+            protocol.as_str(),
             kind,
             total_ttfb_ms,
             self.scaler.ewma_rtt_ms.get(),
@@ -2493,6 +2631,7 @@ impl ConnectionWorker {
                 remaining,
                 recent_speed_bps,
                 self.effective_prefetch_limit_bytes(),
+                self.scaler.last_protocol.get(),
             )
                 && prefetch_handle.is_none()
                 && prefetched_range.is_none()
@@ -2667,7 +2806,9 @@ impl ConnectionWorker {
             SchedulerMetrics::add(&self.metrics.http_setup_ms, attempt_timing.request_setup_ms);
             self.note_first_request_setup(&mut startup, attempt_timing.request_setup_ms);
 
+            let protocol_family = protocol_family_for_version(response.version());
             let http_version = http_version_label(response.version());
+            record_protocol_request_metric(&self.metrics, protocol_family);
 
             if !response.status().is_success() {
                 consecutive_failures = self
@@ -2722,6 +2863,7 @@ impl ConnectionWorker {
                         .record_request_classification(
                             &mut attempt_timing,
                             total_ttfb_ms,
+                            protocol_family,
                         )
                         .await;
                     if startup.first_byte_ms.is_none() {
@@ -2784,6 +2926,7 @@ impl ConnectionWorker {
                     remaining,
                     recent_speed_bps,
                     self.effective_prefetch_limit_bytes(),
+                    self.scaler.last_protocol.get(),
                 )
                     && prefetch_handle.is_none()
                     && prefetched_range.is_none()
@@ -3242,8 +3385,14 @@ fn estimate_speed_bps(started_at: Instant, start_offset: u64, current_offset: u6
     current_offset.saturating_sub(start_offset) as f64 / elapsed
 }
 
-fn should_prefetch(remaining_bytes: u64, recent_speed_bps: f64, borrow_limit_bytes: u64) -> bool {
-    let handshake_bytes = ((recent_speed_bps * (LIVE_PREFETCH_HANDSHAKE_MS as f64 / 1000.0)).ceil())
+fn should_prefetch(
+    remaining_bytes: u64,
+    recent_speed_bps: f64,
+    borrow_limit_bytes: u64,
+    protocol: ProtocolFamily,
+) -> bool {
+    let handshake_ms = protocol_prefetch_handshake_ms(protocol);
+    let handshake_bytes = ((recent_speed_bps * (handshake_ms as f64 / 1000.0)).ceil())
         .max((LIVE_PREFETCH_MIN_MB * MB) as f64) as u64;
     remaining_bytes <= handshake_bytes.max(borrow_limit_bytes)
 }
@@ -3291,10 +3440,24 @@ fn update_scaler_signal_stats(scaler: &Rc<Scaler>, sample_bps: f64) -> (f64, f64
     (alpha, cv)
 }
 
-fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>) -> u32 {
+fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>, protocol: ProtocolFamily) -> u32 {
     let heartbeat_ms = scaler.config.borrow().heartbeat_ms.max(1) as f64;
     let estimated_ms = scaler.ewma_rtt_ms.get() * 12.0;
-    ((estimated_ms / heartbeat_ms).ceil() as u32).clamp(1, 4)
+    let mut heartbeats = ((estimated_ms / heartbeat_ms).ceil() as u32).clamp(1, 4);
+    match protocol {
+        ProtocolFamily::Http1 => {
+            if scaler.reuse_rate.get() < 0.60 {
+                heartbeats = heartbeats.saturating_add(1).clamp(1, 4);
+            }
+        }
+        ProtocolFamily::Http2 => {
+            if scaler.reuse_rate.get() > 0.70 && scaler.reused_rtt_samples.get() >= 2 {
+                heartbeats = heartbeats.saturating_sub(1).clamp(1, 4);
+            }
+        }
+        ProtocolFamily::Other => {}
+    }
+    heartbeats
 }
 
 fn compute_heartbeat_ms(scaler: &Rc<Scaler>) -> u64 {
@@ -3352,7 +3515,12 @@ fn origin_key(url: &str) -> String {
     url.to_string()
 }
 
-async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
+async fn update_reuse_health(
+    scaler: &Rc<Scaler>,
+    url: &str,
+    log_path: &Path,
+    protocol: ProtocolFamily,
+) {
     let now = Instant::now();
     if now.duration_since(scaler.last_reuse_reset.get()) >= Duration::from_secs(60) {
         scaler.reused_count.set(0);
@@ -3367,29 +3535,32 @@ async fn update_reuse_health(scaler: &Rc<Scaler>, url: &str, log_path: &Path) {
         scaler.reused_count.get() as f64 / scaler.total_request_count.get() as f64
     };
     scaler.reuse_rate.set(rate);
-    let threshold = (if rate < 0.5 { 0.10_f64 } else { 0.05_f64 }).clamp(0.05, 0.15);
+    let threshold = protocol_effective_add_threshold(protocol, rate).clamp(0.04, 0.15);
     scaler.effective_add_threshold.set(threshold);
+    let (degraded_threshold, recovered_threshold) = protocol_reuse_thresholds(protocol);
 
     let was_low = scaler.reuse_health_low.get();
-    if !was_low && rate < 0.5 {
+    if !was_low && rate < degraded_threshold {
         scaler.reuse_health_low.set(true);
         log_phase_a_info(
             log_path,
             &format!(
-                "reuse health degraded url={} reuse_rate={:.2} effective_add_threshold={:.2}",
+                "reuse health degraded url={} protocol={} reuse_rate={:.2} effective_add_threshold={:.2}",
                 url,
+                protocol.as_str(),
                 rate,
                 threshold
             ),
         )
         .await;
-    } else if was_low && rate > 0.7 {
+    } else if was_low && rate > recovered_threshold {
         scaler.reuse_health_low.set(false);
         log_phase_a_info(
             log_path,
             &format!(
-                "reuse health recovered url={} reuse_rate={:.2} effective_add_threshold={:.2}",
+                "reuse health recovered url={} protocol={} reuse_rate={:.2} effective_add_threshold={:.2}",
                 url,
+                protocol.as_str(),
                 rate,
                 threshold
             ),
@@ -3462,8 +3633,161 @@ fn http_version_label(version: Version) -> &'static str {
     }
 }
 
-fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
+fn protocol_family_for_version(version: Version) -> ProtocolFamily {
+    match version {
+        Version::HTTP_09 | Version::HTTP_10 | Version::HTTP_11 => ProtocolFamily::Http1,
+        Version::HTTP_2 => ProtocolFamily::Http2,
+        _ => ProtocolFamily::Other,
+    }
+}
+
+fn dominant_protocol_from_metrics(
+    metrics: &Rc<SchedulerMetrics>,
+    fallback: ProtocolFamily,
+) -> ProtocolFamily {
+    let http1 = metrics.http1_requests.get();
+    let http2 = metrics.http2_requests.get();
+    if http1 == 0 && http2 == 0 {
+        fallback
+    } else if http2 > http1 {
+        ProtocolFamily::Http2
+    } else {
+        ProtocolFamily::Http1
+    }
+}
+
+fn record_protocol_request_metric(metrics: &Rc<SchedulerMetrics>, protocol: ProtocolFamily) {
+    match protocol {
+        ProtocolFamily::Http1 => SchedulerMetrics::add(&metrics.http1_requests, 1),
+        ProtocolFamily::Http2 => SchedulerMetrics::add(&metrics.http2_requests, 1),
+        ProtocolFamily::Other => SchedulerMetrics::add(&metrics.http_other_requests, 1),
+    }
+}
+
+fn record_protocol_scale_metric(
+    metrics: &Rc<SchedulerMetrics>,
+    protocol: ProtocolFamily,
+    action: ScalerAction,
+) {
+    match (protocol, action) {
+        (ProtocolFamily::Http1, ScalerAction::Grow) => {
+            SchedulerMetrics::add(&metrics.http1_scale_adds, 1)
+        }
+        (ProtocolFamily::Http1, ScalerAction::Shrink) => {
+            SchedulerMetrics::add(&metrics.http1_scale_drops, 1)
+        }
+        (ProtocolFamily::Http2, ScalerAction::Grow) => {
+            SchedulerMetrics::add(&metrics.http2_scale_adds, 1)
+        }
+        (ProtocolFamily::Http2, ScalerAction::Shrink) => {
+            SchedulerMetrics::add(&metrics.http2_scale_drops, 1)
+        }
+        _ => {}
+    }
+}
+
+fn protocol_prefetch_handshake_ms(protocol: ProtocolFamily) -> u64 {
+    match protocol {
+        ProtocolFamily::Http2 => 250,
+        ProtocolFamily::Http1 | ProtocolFamily::Other => LIVE_PREFETCH_HANDSHAKE_MS,
+    }
+}
+
+fn protocol_growth_shield_min_samples(protocol: ProtocolFamily) -> u64 {
+    match protocol {
+        ProtocolFamily::Http1 => 1,
+        ProtocolFamily::Http2 => MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD,
+        ProtocolFamily::Other => MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD,
+    }
+}
+
+fn protocol_growth_shield_multiplier(protocol: ProtocolFamily) -> f64 {
+    match protocol {
+        ProtocolFamily::Http1 => 1.5,
+        ProtocolFamily::Http2 => 1.0,
+        ProtocolFamily::Other => 1.0,
+    }
+}
+
+fn protocol_reuse_thresholds(protocol: ProtocolFamily) -> (f64, f64) {
+    match protocol {
+        ProtocolFamily::Http1 => (0.60, 0.80),
+        ProtocolFamily::Http2 => (0.35, 0.60),
+        ProtocolFamily::Other => (0.50, 0.70),
+    }
+}
+
+fn protocol_effective_add_threshold(protocol: ProtocolFamily, reuse_rate: f64) -> f64 {
+    match protocol {
+        ProtocolFamily::Http1 => {
+            if reuse_rate < 0.60 {
+                0.12
+            } else if reuse_rate < 0.80 {
+                0.08
+            } else {
+                0.06
+            }
+        }
+        ProtocolFamily::Http2 => {
+            if reuse_rate < 0.35 {
+                0.08
+            } else if reuse_rate < 0.60 {
+                0.06
+            } else {
+                0.04
+            }
+        }
+        ProtocolFamily::Other => {
+            if reuse_rate < 0.50 {
+                0.10
+            } else {
+                0.05
+            }
+        }
+    }
+}
+
+fn compute_protocol_aware_steal_floor_bytes(
+    protocol: ProtocolFamily,
+    reuse_rate: f64,
+    bytes_per_heartbeat: f64,
+) -> u64 {
+    let modifier = match protocol {
+        ProtocolFamily::Http1 => {
+            if reuse_rate < 0.60 { 1.15 } else { 1.0 }
+        }
+        ProtocolFamily::Http2 => {
+            if reuse_rate > 0.60 { 0.75 } else { 0.90 }
+        }
+        ProtocolFamily::Other => 1.0,
+    };
+    let floor = match protocol {
+        ProtocolFamily::Http2 => STORAGE_BLOCK_SIZE,
+        ProtocolFamily::Http1 | ProtocolFamily::Other => 2 * STORAGE_BLOCK_SIZE,
+    };
+    (((bytes_per_heartbeat / 4.0) * modifier).round() as u64).max(floor)
+}
+
+fn compute_http2_client_tuning(expected_concurrency: usize) -> ClientTuning {
+    let concurrency = expected_concurrency.max(1);
+    let stream_window_bytes =
+        ((concurrency as u32).saturating_mul(MB as u32)).clamp(4 * MB as u32, 16 * MB as u32);
+    let connection_window_bytes = stream_window_bytes
+        .saturating_mul(concurrency as u32)
+        .clamp(16 * MB as u32, 64 * MB as u32);
+    let max_send_buffer_bytes =
+        (concurrency.saturating_mul(512 * 1024)).clamp(2 * MB as usize, 8 * MB as usize);
+    ClientTuning {
+        expected_concurrency: concurrency,
+        http2_stream_window_bytes: stream_window_bytes,
+        http2_connection_window_bytes: connection_window_bytes,
+        http2_max_send_buffer_bytes: max_send_buffer_bytes,
+    }
+}
+
+fn build_http_client(http_mode: HttpMode, expected_concurrency: usize) -> (DownloadHttpClient, ClientTuning) {
     let http = crate::connector::TunedConnector::new();
+    let tuning = compute_http2_client_tuning(expected_concurrency);
     let https = match http_mode {
         HttpMode::Auto => HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -3490,15 +3814,15 @@ fn build_http_client(http_mode: HttpMode) -> DownloadHttpClient {
     builder.retry_canceled_requests(true);
     builder.http1_writev(true);
     builder.http2_adaptive_window(true);
-    builder.http2_initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_BYTES));
-    builder.http2_initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_BYTES));
+    builder.http2_initial_stream_window_size(Some(tuning.http2_stream_window_bytes));
+    builder.http2_initial_connection_window_size(Some(tuning.http2_connection_window_bytes));
     builder.http2_max_frame_size(Some(HTTP2_MAX_FRAME_BYTES));
-    builder.http2_max_send_buf_size(HTTP2_MAX_SEND_BUFFER_BYTES);
+    builder.http2_max_send_buf_size(tuning.http2_max_send_buffer_bytes);
     builder.http2_keep_alive_interval(Some(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS)));
     builder.http2_keep_alive_timeout(Duration::from_secs(TCP_KEEPALIVE_INTERVAL_SECS * 2));
     builder.http2_keep_alive_while_idle(true);
     builder.timer(TokioTimer::new());
-    builder.build(https)
+    (builder.build(https), tuning)
 }
 
 async fn send_request_follow_redirects(
@@ -3642,5 +3966,23 @@ mod tests {
         assert_eq!(store.len(), ORIGIN_PHI_RATIO_CAPACITY);
         assert_eq!(store.current_ratio(keep_key), Some(1.1));
         assert_eq!(store.current_ratio("https://new.example:443"), Some(1.9));
+    }
+
+    #[test]
+    fn protocol_thresholds_are_directionally_sensible() {
+        assert!(protocol_effective_add_threshold(ProtocolFamily::Http1, 0.30)
+            > protocol_effective_add_threshold(ProtocolFamily::Http2, 0.30));
+        assert!(compute_protocol_aware_steal_floor_bytes(ProtocolFamily::Http2, 0.80, 0.0)
+            < compute_protocol_aware_steal_floor_bytes(ProtocolFamily::Http1, 0.80, 0.0));
+        assert_eq!(protocol_prefetch_handshake_ms(ProtocolFamily::Http2), 250);
+    }
+
+    #[test]
+    fn http2_client_tuning_scales_with_expected_concurrency() {
+        let small = compute_http2_client_tuning(2);
+        let large = compute_http2_client_tuning(16);
+        assert!(large.http2_stream_window_bytes >= small.http2_stream_window_bytes);
+        assert!(large.http2_connection_window_bytes >= small.http2_connection_window_bytes);
+        assert!(large.http2_max_send_buffer_bytes >= small.http2_max_send_buffer_bytes);
     }
 }
