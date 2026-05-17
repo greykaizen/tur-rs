@@ -71,9 +71,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub per_download_limit: u64,
 
-    /// Disable Linux splice/pwrite zero-copy write path
-    #[arg(long, default_value_t = false)]
-    pub no_splice: bool,
+    /// Disable Linux pwrite zero-copy write path
+    #[arg(long = "no-pwrite", alias = "no-splice", default_value_t = false)]
+    pub no_pwrite: bool,
 
     /// Disable Linux io_uring write path (experimental)
     #[arg(long, default_value_t = false)]

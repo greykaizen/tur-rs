@@ -53,7 +53,7 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     let engine_cmd_tx = engine_tx.clone();
     let storage_config = StorageConfig {
-        use_splice: !cli.no_splice,
+        use_pwrite: !cli.no_pwrite,
         no_io_uring: cli.no_io_uring,
     };
     let engine = DownloadEngine::new(
@@ -110,7 +110,7 @@ async fn run_headless(cli: Cli) -> Result<()> {
 
     let engine_cmd_tx = engine_tx.clone();
     let storage_config = StorageConfig {
-        use_splice: !cli.no_splice,
+        use_pwrite: !cli.no_pwrite,
         no_io_uring: cli.no_io_uring,
     };
     let engine = DownloadEngine::new(

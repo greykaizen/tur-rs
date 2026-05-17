@@ -2,7 +2,7 @@
 # benchmark_write_paths.sh — Compare tur's write paths on Linux
 #
 # Runs tur against itself with different storage backends to measure the
-# performance impact of the splice/pwrite zero-copy path vs tokio seek+write.
+# performance impact of the pwrite zero-copy path vs tokio seek+write.
 #
 # Usage:
 #   ./scripts/benchmark_write_paths.sh <url> [runs] [connections]
@@ -15,8 +15,8 @@
 # Results are written to benchmarks/write-paths/<timestamp>-<name>/
 #
 # Benchmarks three configurations (where applicable):
-#   1. "default"    — splice/pwrite path (Linux default)
-#   2. "no-splice"  — --no-splice → tokio seek+write (falls through to tokio)
+#   1. "default"    — pwrite path (Linux default)
+#   2. "no-splice"  — --no-pwrite → tokio seek+write (falls through to tokio)
 #   3. "no-io-uring" — --no-io-uring (splice still active, no attempt at uring)
 #
 # Each config runs <runs> iterations. Results show avg throughput, min, max,
@@ -36,9 +36,9 @@ usage: benchmark_write_paths.sh <url> [runs] [connections]
   connections   parallel connections per run      (default: 4)
 
 Dedicated Linux write-path microbenchmark. Compares:
-  - default       splice/pwrite (Linux default write path)
-  - no-splice     tokio seek+write (--no-splice)
-  - no-io-uring   splice path with uring disabled (--no-io-uring)
+  - default       pwrite (Linux default write path)
+  - no-splice     tokio seek+write (--no-pwrite)
+  - no-io-uring   pwrite path with uring disabled (--no-io-uring)
 
 example:
   ./scripts/benchmark_write_paths.sh \
@@ -163,7 +163,7 @@ echo
 # ─────────────────────────────────────────────────────────────
 CONFIGS=(
   "default"
-  "no-splice|--no-splice"
+  "no-splice|--no-pwrite"
   "no-io-uring|--no-io-uring"
 )
 
@@ -291,8 +291,8 @@ echo "  Higher throughput (MiB/s)  = faster write path"
 echo "  Lower elapsed (s)          = faster download"
 echo "  Lower RSS (KB)             = more memory efficient"
 echo
-echo "  default       = splice/pwrite path  (Linux default)"
-echo "  no-splice     = tokio seek+write     (--no-splice)"
+echo "  default       = pwrite path  (Linux default)"
+echo "  no-splice     = tokio seek+write     (--no-pwrite)"
 echo "  no-io-uring   = splice with uring disabled  (--no-io-uring)"
 echo
 echo "  raw results: ${SUMMARY}"

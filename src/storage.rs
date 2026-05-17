@@ -13,14 +13,14 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageConfig {
-    pub use_splice: bool,
+    pub use_pwrite: bool,
     pub no_io_uring: bool,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            use_splice: true,
+            use_pwrite: true,
             no_io_uring: false,
         }
     }
@@ -37,7 +37,7 @@ pub fn prepare_download_file(path: &Path, total_size: u64) -> Result<()> {
 pub enum StorageBackendKind {
     Standard,
     LinuxTokio,
-    LinuxSplice,
+    LinuxPwrite,
     LinuxIoUring,
     MacosNoCache,
     WindowsSequential,
@@ -47,7 +47,7 @@ enum DownloadFileInner {
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Tokio(File),
     #[cfg(target_os = "linux")]
-    LinuxSplice(std::fs::File),
+    LinuxPwrite(std::fs::File),
     #[cfg(target_os = "linux")]
     LinuxIoUring {
         tx: mpsc::Sender<LinuxIoUringCommand>,
@@ -76,8 +76,8 @@ impl DownloadFile {
         match &mut self.inner {
             DownloadFileInner::Tokio(file) => platform::write_all_at_tokio(file, offset, data).await,
             #[cfg(target_os = "linux")]
-            DownloadFileInner::LinuxSplice(file) => {
-                platform::write_all_at_splice(file, offset, data).await
+            DownloadFileInner::LinuxPwrite(file) => {
+                platform::write_all_at_pwrite(file, offset, data).await
             }
             #[cfg(target_os = "linux")]
             DownloadFileInner::LinuxIoUring { tx, fallback } => {
@@ -270,8 +270,8 @@ mod platform {
         }
 
         #[cfg(target_os = "linux")]
-        if config.use_splice {
-            return open_download_file_for_write_linux_splice(path).await;
+        if config.use_pwrite {
+            return open_download_file_for_write_linux_pwrite(path).await;
         }
 
         #[cfg(target_os = "linux")]
@@ -306,7 +306,7 @@ mod platform {
     }
 
     #[cfg(target_os = "linux")]
-    pub async fn write_all_at_splice(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
+    pub async fn write_all_at_pwrite(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
 
         let data = data.to_vec();
@@ -324,7 +324,7 @@ mod platform {
     }
 
     #[cfg(target_os = "linux")]
-    async fn open_download_file_for_write_linux_splice(path: &Path) -> Result<DownloadFile> {
+    async fn open_download_file_for_write_linux_pwrite(path: &Path) -> Result<DownloadFile> {
         use std::os::unix::fs::OpenOptionsExt;
 
         let path = path.to_path_buf();
@@ -334,14 +334,14 @@ mod platform {
                 .write(true)
                 .custom_flags(0) // no special flags
                 .open(&path)
-                .map_err(|e| anyhow!("failed to open file for splice write: {e}"))
+                .map_err(|e| anyhow!("failed to open file for pwrite: {e}"))
         })
         .await
         .map_err(|e| anyhow!("spawn_blocking failed: {e}"))??;
 
         Ok(DownloadFile {
-            inner: DownloadFileInner::LinuxSplice(file),
-            backend: StorageBackendKind::LinuxSplice,
+            inner: DownloadFileInner::LinuxPwrite(file),
+            backend: StorageBackendKind::LinuxPwrite,
         })
     }
 
