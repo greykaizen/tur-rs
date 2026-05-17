@@ -1,11 +1,17 @@
 [package]
 name = "tur-rs"
 version = "0.4.1"
+edition = "2024"
+authors = ["Syed Ali"]
+description = "A relentless, high-concurrency download manager built for speed and efficiency. Tur uses dynamic work-stealing and aligned storage to saturate your bandwidth while maintaining a minuscule memory footprint. Inspired by the legends, built for the modern Rust ecosystem."
+license = "GPL-3.0-only"
+readme = "README.md"
+categories = ["command-line-utilities", "network-programming"]
+keywords = ["download", "manager", "fast", "concurrency", "rust"]
 
 [[bin]]
 name = "tur"
 path = "src/main.rs"
-edition = "2024"
 
 [features]
 default = []
@@ -37,5 +43,6 @@ uuid = { version = "1.23.1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
