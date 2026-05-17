@@ -1393,32 +1393,14 @@ async fn run_download_task_local(
     event_tx: mpsc::Sender<EngineEvent>,
     default_connections: usize,
 ) -> Result<()> {
-    let total_size = if let Some(snapshot) = &snapshot {
-        snapshot.task.total_size
-    } else {
-        resolve_total_size(&task).await?
-    };
-
-    task.total_size = total_size;
+    // Phase 6: Parallel startup — overlap HEAD request with setup work
     let origin = origin_key(&task.url);
-    let origin_memory_hit = engine.origin_memory.borrow().memory_hit_for_origin(&origin);
-    if !task.dry_run {
-        engine
-            .origin_memory
-            .borrow_mut()
-            .note_content_length_reliable(&origin, total_size > 0);
-    }
     if task.connections == 0 {
         task.connections = default_connections.max(1);
     }
     if task.borrow_limit_mb == 0 {
         task.borrow_limit_mb = DEFAULT_BORROW_LIMIT_MB;
     }
-
-    let _ = event_tx.send(EngineEvent::TotalSize(task.id, total_size)).await;
-    let _ = event_tx
-        .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Downloading))
-        .await;
 
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
@@ -1429,11 +1411,88 @@ async fn run_download_task_local(
         .protocol_hint_for_origin(&origin)
         .unwrap_or(ProtocolFamily::Other);
     let phi_max_ratio = engine.origin_phi_ratios.borrow_mut().ratio_for_origin(&origin);
+    let origin_memory_hit = engine.origin_memory.borrow().memory_hit_for_origin(&origin);
     let shared_write_latency_ms = Rc::new(Cell::new(10.0));
     let write_buffer_cap_bytes = engine.write_buffer_cap_bytes.clone();
     let adaptive_minimum_steal_bytes = Rc::new(Cell::new(
         (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
     ));
+
+    // Set up connection acquisition state early so HEAD and connections can run concurrently
+    let leased_connections = Rc::new(Cell::new(0usize));
+    let desired_initial_connections = task.connections.max(1);
+
+    let total_size = if let Some(snapshot) = &snapshot {
+        snapshot.task.total_size
+    } else if task.dry_run && task.dry_run_size_mb.is_some() {
+        task.dry_run_size_mb.unwrap() * MB
+    } else {
+        // Phase 6: Run HEAD request concurrently with connection budget acquisition
+        let (head_client, _) = build_http_client(task.http_mode, task.max_connections.max(1), None);
+        let head_url = task.url.clone();
+
+        let mut conn_done = false;
+        let conn_fut = async {
+            let mut cnt = 0usize;
+            while cnt == 0 {
+                if control.is_halted() {
+                    break;
+                }
+                if engine.request_connection() {
+                    cnt = 1;
+                    leased_connections.set(leased_connections.get() + 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            while cnt < desired_initial_connections {
+                if !engine.request_connection() {
+                    break;
+                }
+                cnt += 1;
+                leased_connections.set(leased_connections.get() + 1);
+            }
+            cnt
+        };
+        let head_fut =
+            send_request_follow_redirects(&head_client, Method::HEAD, &head_url, None);
+        tokio::pin!(head_fut);
+        tokio::pin!(conn_fut);
+
+        let res = loop {
+            tokio::select! {
+                result = &mut head_fut => {
+                    break result?;
+                }
+                _ = &mut conn_fut, if !conn_done => {
+                    conn_done = true;
+                }
+            }
+        };
+
+        let _ = conn_fut.await;
+        let size = res
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if size == 0 {
+            return Err(anyhow!("Could not determine file size"));
+        }
+
+        if !task.dry_run {
+            engine.origin_memory.borrow_mut().note_content_length_reliable(&origin, size > 0);
+        }
+
+        size
+    };
+
+    task.total_size = total_size;
+    let _ = event_tx.send(EngineEvent::TotalSize(task.id, total_size)).await;
+    let _ = event_tx
+        .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Downloading))
+        .await;
     let mut coordinator = if let Some(snapshot) = snapshot {
         Coordinator::from_snapshot(
             snapshot.coordinator,
@@ -1501,26 +1560,27 @@ async fn run_download_task_local(
     let scaler_engine = engine.clone();
 
     let handles = Rc::new(RefCell::new(Vec::<WorkerSlot>::new()));
-    let leased_connections = Rc::new(Cell::new(0usize));
-    let desired_initial_connections = task.connections.max(1);
-    let mut initial_connections = 0usize;
-    while initial_connections == 0 {
-        if control.is_halted() {
-            break;
+    // For snapshot/dry_run paths, connections were not pre-acquired; do it now
+    let mut initial_connections = leased_connections.get();
+    if initial_connections == 0 && !matches!(total_size, 0) {
+        while initial_connections == 0 {
+            if control.is_halted() {
+                break;
+            }
+            if engine.request_connection() {
+                initial_connections = 1;
+                leased_connections.set(leased_connections.get() + 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if engine.request_connection() {
-            initial_connections = 1;
+        while initial_connections < desired_initial_connections {
+            if !engine.request_connection() {
+                break;
+            }
+            initial_connections += 1;
             leased_connections.set(leased_connections.get() + 1);
-            break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    while initial_connections < desired_initial_connections {
-        if !engine.request_connection() {
-            break;
-        }
-        initial_connections += 1;
-        leased_connections.set(leased_connections.get() + 1);
     }
     if initial_connections == 0 {
         let _ = event_tx
@@ -2047,29 +2107,6 @@ async fn run_download_task_local(
     }
 
     Ok(())
-}
-
-async fn resolve_total_size(task: &DownloadTask) -> Result<u64> {
-    if task.dry_run {
-        if let Some(size_mb) = task.dry_run_size_mb {
-            return Ok(size_mb * MB);
-        }
-    }
-
-    let (client, _) = build_http_client(task.http_mode, task.max_connections.max(1), None);
-    let res = send_request_follow_redirects(&client, Method::HEAD, &task.url, None).await?;
-    let total_size = res
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if total_size == 0 {
-        return Err(anyhow!("Could not determine file size"));
-    }
-
-    Ok(total_size)
 }
 
 impl Coordinator {
@@ -3532,6 +3569,10 @@ impl ConnectionWorker {
                 self.scaler
                     .slow_start_remaining
                     .set(self.scaler.slow_start_remaining.get().saturating_add(1));
+                // Signal the current worker to stop so the scaler releases budget
+                self.worker_control.stop_requested.set(true);
+                // Relinquish the current range so it can be reassigned to another worker
+                self.relinquish_range(range, current_start).await;
                 ms
             }
             RetryHint::ShrinkRange(ms) => ms,
