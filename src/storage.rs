@@ -2,14 +2,29 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use anyhow::Result;
-#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+#[cfg(target_os = "linux")]
 use anyhow::anyhow;
 use tokio::fs::File;
-#[cfg(not(all(target_os = "linux", feature = "linux-io-uring-experimental")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+#[cfg(target_os = "linux")]
 use tokio::sync::{mpsc, oneshot};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageConfig {
+    pub use_splice: bool,
+    pub no_io_uring: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            use_splice: true,
+            no_io_uring: false,
+        }
+    }
+}
 
 pub fn prepare_download_file(path: &Path, total_size: u64) -> Result<()> {
     let file = std::fs::File::create(path)?;
@@ -22,17 +37,20 @@ pub fn prepare_download_file(path: &Path, total_size: u64) -> Result<()> {
 pub enum StorageBackendKind {
     Standard,
     LinuxTokio,
-    LinuxIoUringExperimental,
+    LinuxSplice,
+    LinuxIoUring,
     MacosNoCache,
     WindowsSequential,
 }
 
 enum DownloadFileInner {
-    #[cfg_attr(all(target_os = "linux", feature = "linux-io-uring-experimental"), allow(dead_code))]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Tokio(File),
-    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    #[cfg(target_os = "linux")]
+    LinuxSplice(std::fs::File),
+    #[cfg(target_os = "linux")]
     LinuxIoUring {
-        tx: mpsc::UnboundedSender<LinuxIoUringCommand>,
+        tx: mpsc::Sender<LinuxIoUringCommand>,
         fallback: File,
     },
 }
@@ -49,7 +67,7 @@ impl DownloadFile {
 
     pub fn direct_io_alignment(&self) -> Option<usize> {
         match self.backend {
-            StorageBackendKind::LinuxIoUringExperimental => Some(platform::DIRECT_IO_ALIGNMENT),
+            StorageBackendKind::LinuxIoUring => Some(platform::DIRECT_IO_ALIGNMENT),
             _ => None,
         }
     }
@@ -57,7 +75,11 @@ impl DownloadFile {
     pub async fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         match &mut self.inner {
             DownloadFileInner::Tokio(file) => platform::write_all_at_tokio(file, offset, data).await,
-            #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+            #[cfg(target_os = "linux")]
+            DownloadFileInner::LinuxSplice(file) => {
+                platform::write_all_at_splice(file, offset, data).await
+            }
+            #[cfg(target_os = "linux")]
             DownloadFileInner::LinuxIoUring { tx, fallback } => {
                 let alignment = platform::DIRECT_IO_ALIGNMENT as u64;
                 let start = offset;
@@ -93,6 +115,7 @@ impl DownloadFile {
                         data: aligned,
                         resp: resp_tx,
                     })
+                    .await
                     .map_err(|_| anyhow!("io_uring backend thread is not available"))?;
                     resp_rx
                         .await
@@ -111,15 +134,22 @@ impl DownloadFile {
 
 impl Drop for DownloadFile {
     fn drop(&mut self) {
-        #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+        #[cfg(target_os = "linux")]
         if let DownloadFileInner::LinuxIoUring { tx, .. } = &self.inner {
-            let _ = tx.send(LinuxIoUringCommand::Shutdown);
+            let _ = tx.try_send(LinuxIoUringCommand::Shutdown);
         }
     }
 }
 
 pub async fn open_download_file_for_write(path: &Path) -> Result<DownloadFile> {
-    platform::open_download_file_for_write(path).await
+    open_download_file_for_write_with_config(path, &StorageConfig::default()).await
+}
+
+pub async fn open_download_file_for_write_with_config(
+    path: &Path,
+    config: &StorageConfig,
+) -> Result<DownloadFile> {
+    platform::open_download_file_for_write(path, config).await
 }
 
 #[derive(Debug)]
@@ -176,7 +206,7 @@ impl Drop for AlignedBuffer {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+#[cfg(target_os = "linux")]
 unsafe impl tokio_uring::buf::IoBuf for AlignedBuffer {
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -191,10 +221,10 @@ unsafe impl tokio_uring::buf::IoBuf for AlignedBuffer {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+#[cfg(target_os = "linux")]
 unsafe impl Send for AlignedBuffer {}
 
-#[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+#[cfg(target_os = "linux")]
 enum LinuxIoUringCommand {
     WriteAllAt {
         offset: u64,
@@ -208,7 +238,7 @@ mod platform {
     use super::*;
 
     pub const DIRECT_IO_ALIGNMENT: usize = 4096;
-    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub const DIRECT_IO_BLOCK_BYTES: usize = 4096;
 
@@ -230,10 +260,23 @@ mod platform {
         Ok(())
     }
 
-    pub async fn open_download_file_for_write(path: &Path) -> Result<DownloadFile> {
-        #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
-        {
+    pub async fn open_download_file_for_write(
+        path: &Path,
+        config: &StorageConfig,
+    ) -> Result<DownloadFile> {
+        #[cfg(target_os = "linux")]
+        if !config.no_io_uring {
             return open_download_file_for_write_linux_uring(path).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        if config.use_splice {
+            return open_download_file_for_write_linux_splice(path).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            return open_download_file_for_write_linux_tokio(path).await;
         }
 
         #[cfg(target_os = "macos")]
@@ -246,34 +289,13 @@ mod platform {
             return open_download_file_for_write_windows(path).await;
         }
 
-        #[cfg(not(all(target_os = "linux", feature = "linux-io-uring-experimental")))]
-        {
-            let file = OpenOptions::new().write(true).open(path).await?;
-            let backend = detect_backend_kind();
-            Ok(DownloadFile {
-                inner: DownloadFileInner::Tokio(file),
-                backend,
-            })
-        }
-    }
-
-    #[cfg_attr(all(target_os = "linux", feature = "linux-io-uring-experimental"), allow(dead_code))]
-    fn detect_backend_kind() -> StorageBackendKind {
-        #[cfg(target_os = "linux")]
-        {
-            return StorageBackendKind::LinuxTokio;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            return StorageBackendKind::MacosNoCache;
-        }
-        #[cfg(target_os = "windows")]
-        {
-            return StorageBackendKind::WindowsSequential;
-        }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
-            return StorageBackendKind::Standard;
+            let file = OpenOptions::new().write(true).open(path).await?;
+            Ok(DownloadFile {
+                inner: DownloadFileInner::Tokio(file),
+                backend: StorageBackendKind::Standard,
+            })
         }
     }
 
@@ -283,12 +305,64 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "linux-io-uring-experimental"))]
+    #[cfg(target_os = "linux")]
+    pub async fn write_all_at_splice(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let data = data.to_vec();
+        // Clone the fd so the spawned closure owns its own handle
+        let cloned = file.try_clone()?;
+
+        tokio::task::spawn_blocking(move || {
+            cloned.write_all_at(&data, offset)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn open_download_file_for_write_linux_splice(path: &Path) -> Result<DownloadFile> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = path.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || {
+            // Open with O_APPEND disabled and O_WRONLY for posix write path
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0) // no special flags
+                .open(&path)
+                .map_err(|e| anyhow!("failed to open file for splice write: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("spawn_blocking failed: {e}"))??;
+
+        Ok(DownloadFile {
+            inner: DownloadFileInner::LinuxSplice(file),
+            backend: StorageBackendKind::LinuxSplice,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn open_download_file_for_write_linux_tokio(path: &Path) -> Result<DownloadFile> {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await?;
+        Ok(DownloadFile {
+            inner: DownloadFileInner::Tokio(file),
+            backend: StorageBackendKind::LinuxTokio,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
     async fn open_download_file_for_write_linux_uring(path: &Path) -> Result<DownloadFile> {
         use rustix::fs::OFlags;
         use std::os::unix::fs::OpenOptionsExt;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<LinuxIoUringCommand>();
+        let (tx, mut rx) = mpsc::channel::<LinuxIoUringCommand>(32);
         let path = path.to_path_buf();
         let fallback = File::from_std(std::fs::OpenOptions::new().write(true).open(&path)?);
         std::thread::Builder::new()
@@ -322,7 +396,7 @@ mod platform {
 
         Ok(DownloadFile {
             inner: DownloadFileInner::LinuxIoUring { tx, fallback },
-            backend: StorageBackendKind::LinuxIoUringExperimental,
+            backend: StorageBackendKind::LinuxIoUring,
         })
     }
 

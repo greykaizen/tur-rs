@@ -15,13 +15,21 @@ use uuid::Uuid;
 
 use cli::Cli;
 use engine::{DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ScheduleMode};
+use storage::StorageConfig;
 use tui::TuiApp;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = if cli.runtime_threads <= 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cli.runtime_threads)
+            .enable_all()
+            .build()?
+    };
     let local = LocalSet::new();
     local.block_on(&runtime, async_main(cli))
 }
@@ -44,12 +52,17 @@ async fn async_main(cli: Cli) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(100);
 
     let engine_cmd_tx = engine_tx.clone();
+    let storage_config = StorageConfig {
+        use_splice: !cli.no_splice,
+        no_io_uring: cli.no_io_uring,
+    };
     let engine = DownloadEngine::new(
         connections,
         tasks_limit,
         max_total_connections,
         global_bandwidth_limit_bps,
         !cli.no_origin_memory,
+        storage_config,
     );
     tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {
@@ -96,12 +109,17 @@ async fn run_headless(cli: Cli) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(100);
 
     let engine_cmd_tx = engine_tx.clone();
+    let storage_config = StorageConfig {
+        use_splice: !cli.no_splice,
+        no_io_uring: cli.no_io_uring,
+    };
     let engine = DownloadEngine::new(
         connections,
         tasks_limit,
         max_total_connections,
         global_bandwidth_limit_bps,
         !cli.no_origin_memory,
+        storage_config,
     );
     tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {

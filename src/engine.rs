@@ -26,7 +26,7 @@ use sysinfo::System;
 use url::Url;
 use uuid::Uuid;
 
-use crate::storage;
+use crate::storage::{self, StorageConfig};
 
 const MB: u64 = 1024 * 1024;
 const INDEX_STATE_MB: u64 = 8;
@@ -900,6 +900,7 @@ pub struct DownloadEngine {
     origin_h2_tunings: RefCell<OriginH2TuningStore>,
     origin_memory: Rc<RefCell<OriginMemoryStore>>,
     pub write_buffer_cap_bytes: Rc<Cell<usize>>,
+    pub storage_config: StorageConfig,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
 
@@ -1065,6 +1066,7 @@ impl DownloadEngine {
         max_total_connections: usize,
         global_bandwidth_limit_bps: u64,
         enable_origin_memory: bool,
+        storage_config: StorageConfig,
     ) -> Rc<Self> {
         let configured_budget = max_total_connections.max(1);
         let origin_memory = OriginMemoryStore::load_enabled(enable_origin_memory);
@@ -1083,6 +1085,7 @@ impl DownloadEngine {
             origin_h2_tunings: RefCell::new(origin_h2_tunings),
             origin_memory: Rc::new(RefCell::new(origin_memory)),
             write_buffer_cap_bytes: Rc::new(Cell::new(4 * MB as usize)),
+            storage_config,
             downloads: RefCell::new(Vec::new()),
         })
     }
@@ -1620,6 +1623,7 @@ async fn run_download_task_local(
             index_state: index_state.clone(),
             bucket: bucket.clone(),
             scaler: scaler.clone(),
+            storage_config: engine.storage_config.clone(),
         };
 
         let handle = tokio::task::spawn_local(async move {
@@ -1890,6 +1894,7 @@ async fn run_download_task_local(
                     index_state: scaler_index_state.clone(),
                     bucket: scaler_bucket.clone(),
                     scaler: scaler_for_task.clone(),
+                    storage_config: scaler_engine.storage_config.clone(),
                 };
                 connection_id_counter += 1;
                 let handle = tokio::task::spawn_local(async move {
@@ -2611,6 +2616,7 @@ struct ConnectionWorker {
     index_state: Rc<IndexStateMap>,
     bucket: Rc<TokenBucket>,
     scaler: Rc<Scaler>,
+    storage_config: storage::StorageConfig,
 }
 
 #[derive(Debug, Default)]
@@ -3108,7 +3114,7 @@ impl ConnectionWorker {
     async fn run_live(self) -> Result<()> {
         let worker_started_at = Instant::now();
         let file_open_started = Instant::now();
-        let mut file = storage::open_download_file_for_write(&self.file_path).await?;
+        let mut file = storage::open_download_file_for_write_with_config(&self.file_path, &self.storage_config).await?;
         let file_backend = file.backend();
         let open_file_ms = file_open_started.elapsed().as_millis() as u64;
 

@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "tur", author, version, about, long_about = None)]
 pub struct Cli {
     /// URL(s) to download
     #[arg(short, long, num_args = 1..)]
@@ -70,4 +70,16 @@ pub struct Cli {
     /// Per-download bandwidth cap in Mbps, 0 disables the cap
     #[arg(long, default_value_t = 0)]
     pub per_download_limit: u64,
+
+    /// Disable Linux splice/pwrite zero-copy write path
+    #[arg(long, default_value_t = false)]
+    pub no_splice: bool,
+
+    /// Disable Linux io_uring write path (experimental)
+    #[arg(long, default_value_t = false)]
+    pub no_io_uring: bool,
+
+    /// Number of worker threads for the async runtime; 1 = single-threaded
+    #[arg(long, default_value_t = 1)]
+    pub runtime_threads: usize,
 }
