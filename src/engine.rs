@@ -259,6 +259,7 @@ struct SchedulerMetrics {
     startup_first_request_setup_ms: Cell<u64>,
     startup_first_byte_ms: Cell<u64>,
     startup_total_to_first_byte_ms: Cell<u64>,
+    max_active_connections_observed: Cell<u64>,
     reused_requests: Cell<u64>,
     fresh_requests: Cell<u64>,
     http1_reused_requests: Cell<u64>,
@@ -283,7 +284,7 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} max_active_connections_observed={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -311,6 +312,7 @@ impl SchedulerMetrics {
             self.startup_first_request_setup_ms.get(),
             self.startup_first_byte_ms.get(),
             self.startup_total_to_first_byte_ms.get(),
+            self.max_active_connections_observed.get(),
             self.reused_requests.get(),
             self.fresh_requests.get(),
             self.http1_reused_requests.get(),
@@ -482,6 +484,70 @@ struct ClientTuning {
     http2_stream_window_bytes: u32,
     http2_connection_window_bytes: u32,
     http2_max_send_buffer_bytes: usize,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OriginH2TuningEntry {
+    tuning: ClientTuning,
+    last_used_tick: u64,
+}
+
+#[derive(Debug, Default)]
+struct OriginH2TuningStore {
+    entries: HashMap<String, OriginH2TuningEntry>,
+    usage_tick: u64,
+}
+
+impl OriginH2TuningStore {
+    fn next_tick(&mut self) -> u64 {
+        self.usage_tick = self.usage_tick.saturating_add(1);
+        self.usage_tick
+    }
+
+    fn tuning_for_origin(&mut self, origin: &str) -> Option<ClientTuning> {
+        let tick = self.next_tick();
+        self.entries.get_mut(origin).map(|entry| {
+            entry.last_used_tick = tick;
+            entry.tuning
+        })
+    }
+
+    fn update_origin_tuning(&mut self, origin: String, tuning: ClientTuning) {
+        let tick = self.next_tick();
+        self.entries.insert(
+            origin,
+            OriginH2TuningEntry {
+                tuning,
+                last_used_tick: tick,
+            },
+        );
+        self.prune_lru();
+    }
+
+    #[cfg(test)]
+    fn current_tuning(&self, origin: &str) -> Option<ClientTuning> {
+        self.entries.get(origin).map(|entry| entry.tuning)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn prune_lru(&mut self) {
+        while self.entries.len() > ORIGIN_PHI_RATIO_CAPACITY {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick)
+                .map(|(origin, _)| origin.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&lru_key);
+        }
+    }
 }
 
 pub struct DownloadHandle {
@@ -587,6 +653,7 @@ pub struct DownloadEngine {
     pub refill_interval_ms: Cell<u64>,
     pub last_memory_check: Cell<Instant>,
     origin_phi_ratios: RefCell<OriginPhiRatioStore>,
+    origin_h2_tunings: RefCell<OriginH2TuningStore>,
     pub write_buffer_cap_bytes: Rc<Cell<usize>>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
@@ -764,6 +831,7 @@ impl DownloadEngine {
             refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
             last_memory_check: Cell::new(Instant::now()),
             origin_phi_ratios: RefCell::new(OriginPhiRatioStore::default()),
+            origin_h2_tunings: RefCell::new(OriginH2TuningStore::default()),
             write_buffer_cap_bytes: Rc::new(Cell::new(4 * MB as usize)),
             downloads: RefCell::new(Vec::new()),
         })
@@ -1153,7 +1221,9 @@ async fn run_download_task_local(
     let max_connections = task.max_connections.max(min_connections);
     task.connections = task.connections.clamp(min_connections, max_connections);
     let (work_tx, work_rx) = mpsc::channel(128);
-    let (http_client, client_tuning) = build_http_client(task.http_mode, max_connections);
+    let learned_h2_tuning = engine.origin_h2_tunings.borrow_mut().tuning_for_origin(&origin);
+    let (http_client, client_tuning) =
+        build_http_client(task.http_mode, max_connections, learned_h2_tuning);
 
     let scaler_config = ScalerConfig {
         min_connections,
@@ -1199,6 +1269,7 @@ async fn run_download_task_local(
         return Ok(());
     }
     scaler.n_active.set(initial_connections);
+    record_max_active_connections(&metrics, initial_connections);
 
     for connection_id in 0..initial_connections {
         let worker_control = WorkerControl::new(connection_id as u32);
@@ -1430,6 +1501,7 @@ async fn run_download_task_local(
                         dominant_protocol,
                         ScalerAction::Grow,
                     );
+                    record_max_active_connections(&scaler_metrics, n_active + 1);
                 }
             }
 
@@ -1576,11 +1648,34 @@ async fn run_download_task_local(
     metrics
         .adaptive_refill_interval_ms_final
         .set(bucket.refill_interval_ms.get().max(10));
+    let dominant_protocol = dominant_protocol_from_metrics(&metrics, scaler.last_protocol.get());
+    if dominant_protocol == ProtocolFamily::Http2 && metrics.http2_requests.get() > 0 {
+        let learned_h2_tuning = learn_http2_client_tuning(
+            max_connections,
+            metrics.max_active_connections_observed.get().max(1) as usize,
+            scaler.ewma_rtt_ms.get(),
+            scaler.ewma_throughput.get(),
+        );
+        engine
+            .origin_h2_tunings
+            .borrow_mut()
+            .update_origin_tuning(origin.clone(), learned_h2_tuning);
+        coordinator.log(&format!(
+            "phase_h2_tuning_update origin={} observed_rtt_ms={:.1} ewma_throughput_bps={:.0} max_active_connections_observed={} next_initial_h2_stream_window_bytes={} next_initial_h2_connection_window_bytes={} next_initial_h2_max_send_buffer_bytes={}",
+            origin,
+            scaler.ewma_rtt_ms.get(),
+            scaler.ewma_throughput.get(),
+            metrics.max_active_connections_observed.get().max(1),
+            learned_h2_tuning.http2_stream_window_bytes,
+            learned_h2_tuning.http2_connection_window_bytes,
+            learned_h2_tuning.http2_max_send_buffer_bytes,
+        ));
+    }
     coordinator.log_summary(total_size);
     coordinator.log(&format!(
-        "phase_protocol_summary http_mode={} dominant_protocol={} http1_requests={} http2_requests={} http_other_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} h2_stream_window_bytes={} h2_connection_window_bytes={} h2_max_send_buffer_bytes={} expected_concurrency={}",
+        "phase_protocol_summary http_mode={} dominant_protocol={} http1_requests={} http2_requests={} http_other_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} initial_h2_stream_window_bytes={} initial_h2_connection_window_bytes={} initial_h2_max_send_buffer_bytes={} configured_max_connections={} max_active_connections_observed={} h2_tuning_source={}",
         task.http_mode.as_str(),
-        dominant_protocol_from_metrics(&metrics, scaler.last_protocol.get()).as_str(),
+        dominant_protocol.as_str(),
         metrics.http1_requests.get(),
         metrics.http2_requests.get(),
         metrics.http_other_requests.get(),
@@ -1596,6 +1691,8 @@ async fn run_download_task_local(
         client_tuning.http2_connection_window_bytes,
         client_tuning.http2_max_send_buffer_bytes,
         client_tuning.expected_concurrency,
+        metrics.max_active_connections_observed.get(),
+        client_tuning.source,
     ));
     coordinator.log(&format!(
         "phase_a_summary alpha={:.3} cv={:.3} ewma_rtt_ms={:.1} ewma_handshake_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} reused_rtt_samples={}",
@@ -1666,7 +1763,7 @@ async fn resolve_total_size(task: &DownloadTask) -> Result<u64> {
         }
     }
 
-    let (client, _) = build_http_client(task.http_mode, task.max_connections.max(1));
+    let (client, _) = build_http_client(task.http_mode, task.max_connections.max(1), None);
     let res = send_request_follow_redirects(&client, Method::HEAD, &task.url, None).await?;
     let total_size = res
         .headers()
@@ -3686,6 +3783,13 @@ fn record_protocol_scale_metric(
     }
 }
 
+fn record_max_active_connections(metrics: &Rc<SchedulerMetrics>, n_active: usize) {
+    let observed = n_active as u64;
+    if observed > metrics.max_active_connections_observed.get() {
+        metrics.max_active_connections_observed.set(observed);
+    }
+}
+
 fn protocol_prefetch_handshake_ms(protocol: ProtocolFamily) -> u64 {
     match protocol {
         ProtocolFamily::Http2 => 250,
@@ -3782,12 +3886,44 @@ fn compute_http2_client_tuning(expected_concurrency: usize) -> ClientTuning {
         http2_stream_window_bytes: stream_window_bytes,
         http2_connection_window_bytes: connection_window_bytes,
         http2_max_send_buffer_bytes: max_send_buffer_bytes,
+        source: "default",
     }
 }
 
-fn build_http_client(http_mode: HttpMode, expected_concurrency: usize) -> (DownloadHttpClient, ClientTuning) {
+fn learn_http2_client_tuning(
+    expected_concurrency: usize,
+    max_active_connections_observed: usize,
+    ewma_rtt_ms: f64,
+    ewma_throughput_bps: f64,
+) -> ClientTuning {
+    let observed_concurrency = max_active_connections_observed.max(1);
+    let per_stream_throughput = (ewma_throughput_bps / observed_concurrency as f64).max(1.0);
+    let bdp_bytes = (per_stream_throughput * (ewma_rtt_ms.max(1.0) / 1000.0)).round();
+    let stream_window_bytes =
+        ((bdp_bytes as u32).saturating_mul(4)).clamp(MB as u32, 16 * MB as u32);
+    let connection_window_bytes = stream_window_bytes
+        .saturating_mul(expected_concurrency.max(observed_concurrency) as u32)
+        .clamp(16 * MB as u32, 64 * MB as u32);
+    let max_send_buffer_bytes = ((stream_window_bytes as usize)
+        .saturating_mul(expected_concurrency.max(observed_concurrency))
+        / 2)
+        .clamp(2 * MB as usize, 8 * MB as usize);
+    ClientTuning {
+        expected_concurrency: expected_concurrency.max(observed_concurrency),
+        http2_stream_window_bytes: stream_window_bytes,
+        http2_connection_window_bytes: connection_window_bytes,
+        http2_max_send_buffer_bytes: max_send_buffer_bytes,
+        source: "learned-origin",
+    }
+}
+
+fn build_http_client(
+    http_mode: HttpMode,
+    expected_concurrency: usize,
+    learned_tuning: Option<ClientTuning>,
+) -> (DownloadHttpClient, ClientTuning) {
     let http = crate::connector::TunedConnector::new();
-    let tuning = compute_http2_client_tuning(expected_concurrency);
+    let tuning = learned_tuning.unwrap_or_else(|| compute_http2_client_tuning(expected_concurrency));
     let https = match http_mode {
         HttpMode::Auto => HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -3984,5 +4120,24 @@ mod tests {
         assert!(large.http2_stream_window_bytes >= small.http2_stream_window_bytes);
         assert!(large.http2_connection_window_bytes >= small.http2_connection_window_bytes);
         assert!(large.http2_max_send_buffer_bytes >= small.http2_max_send_buffer_bytes);
+    }
+
+    #[test]
+    fn learned_http2_tuning_is_origin_scoped_and_pruned() {
+        let mut store = OriginH2TuningStore::default();
+        let tuning = learn_http2_client_tuning(4, 3, 120.0, 12.0 * MB as f64);
+        store.update_origin_tuning("https://example.com:443".to_string(), tuning);
+        assert_eq!(
+            store.current_tuning("https://example.com:443").unwrap().source,
+            "learned-origin"
+        );
+
+        for idx in 0..ORIGIN_PHI_RATIO_CAPACITY {
+            store.update_origin_tuning(
+                format!("https://host{idx}.example:443"),
+                compute_http2_client_tuning(2),
+            );
+        }
+        assert!(store.len() <= ORIGIN_PHI_RATIO_CAPACITY);
     }
 }
