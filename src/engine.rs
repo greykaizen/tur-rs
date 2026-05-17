@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use http::header::{ACCEPT, CONTENT_LENGTH, LOCATION, RANGE, USER_AGENT};
+use http::header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, USER_AGENT};
 use http::{Method, Request, Uri, Version};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
@@ -49,6 +50,7 @@ const WRITE_BUFFER_LARGE_SPEED_BPS: u64 = 3 * MB;
 const WRITE_BUFFER_MAX_SPEED_BPS: u64 = 6 * MB;
 const HTTP2_MAX_FRAME_BYTES: u32 = 256 * 1024;
 const ORIGIN_PHI_RATIO_CAPACITY: usize = 256;
+const ORIGIN_MEMORY_CAPACITY: usize = 1000;
 const TCP_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
@@ -277,6 +279,7 @@ struct SchedulerMetrics {
     adaptive_min_steal_bytes_final: Cell<u64>,
     adaptive_heartbeat_ms_final: Cell<u64>,
     adaptive_refill_interval_ms_final: Cell<u64>,
+    max_prefetch_trigger_bytes: Cell<u64>,
     max_write_buffer_target_bytes: Cell<u64>,
     max_ewma_write_latency_x10: Cell<u64>,
 }
@@ -284,7 +287,7 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} max_active_connections_observed={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} max_active_connections_observed={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_prefetch_trigger_bytes={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -330,6 +333,7 @@ impl SchedulerMetrics {
             self.adaptive_min_steal_bytes_final.get(),
             self.adaptive_heartbeat_ms_final.get(),
             self.adaptive_refill_interval_ms_final.get(),
+            self.max_prefetch_trigger_bytes.get(),
             self.max_write_buffer_target_bytes.get(),
             self.max_ewma_write_latency_x10.get() as f64 / 10.0,
         )
@@ -337,6 +341,12 @@ impl SchedulerMetrics {
 
     fn add(cell: &Cell<u64>, value: u64) {
         cell.set(cell.get().saturating_add(value));
+    }
+
+    fn update_max(cell: &Cell<u64>, value: u64) {
+        if value > cell.get() {
+            cell.set(value);
+        }
     }
 }
 
@@ -401,7 +411,7 @@ pub enum ScalerAction {
     Hold,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum ProtocolFamily {
     Http1,
     Http2,
@@ -478,13 +488,30 @@ impl Scaler {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum H2TuningSource {
+    Default,
+    LearnedOrigin,
+    OriginMemoryHint,
+}
+
+impl H2TuningSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::LearnedOrigin => "learned-origin",
+            Self::OriginMemoryHint => "origin-memory-hint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct ClientTuning {
     expected_concurrency: usize,
     http2_stream_window_bytes: u32,
     http2_connection_window_bytes: u32,
     http2_max_send_buffer_bytes: usize,
-    source: &'static str,
+    source: H2TuningSource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -497,6 +524,223 @@ struct OriginH2TuningEntry {
 struct OriginH2TuningStore {
     entries: HashMap<String, OriginH2TuningEntry>,
     usage_tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedOriginProfile {
+    phi_ratio: Option<f64>,
+    h2_tuning: Option<ClientTuning>,
+    protocol_hint: Option<ProtocolFamily>,
+    reuse_rate: Option<f64>,
+    handshake_ms: Option<f64>,
+    supports_ranges: Option<bool>,
+    content_length_reliable: Option<bool>,
+    saw_rate_limit: bool,
+    last_used_tick: u64,
+}
+
+#[derive(Debug, Default)]
+struct OriginMemoryStore {
+    entries: HashMap<String, PersistedOriginProfile>,
+    usage_tick: u64,
+    enabled: bool,
+}
+
+impl OriginMemoryStore {
+    fn load_enabled(enabled: bool) -> Self {
+        if !enabled {
+            return Self {
+                entries: HashMap::new(),
+                usage_tick: 0,
+                enabled: false,
+            };
+        }
+        let path = origin_memory_path();
+        let Ok(bytes) = fs::read(path) else {
+            return Self {
+                entries: HashMap::new(),
+                usage_tick: 0,
+                enabled: true,
+            };
+        };
+        let Ok(entries) = bincode::deserialize::<HashMap<String, PersistedOriginProfile>>(&bytes) else {
+            return Self {
+                entries: HashMap::new(),
+                usage_tick: 0,
+                enabled: true,
+            };
+        };
+        let usage_tick = entries
+            .values()
+            .map(|profile| profile.last_used_tick)
+            .max()
+            .unwrap_or(0);
+        Self {
+            entries,
+            usage_tick,
+            enabled: true,
+        }
+    }
+
+    fn persist(&self) {
+        if !self.enabled {
+            return;
+        }
+        let path = origin_memory_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = bincode::serialize(&self.entries) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.usage_tick = self.usage_tick.saturating_add(1);
+        self.usage_tick
+    }
+
+    fn touch_profile(&mut self, origin: &str) -> &mut PersistedOriginProfile {
+        let tick = self.next_tick();
+        let profile = self.entries.entry(origin.to_string()).or_insert(PersistedOriginProfile {
+            phi_ratio: None,
+            h2_tuning: None,
+            protocol_hint: None,
+            reuse_rate: None,
+            handshake_ms: None,
+            supports_ranges: None,
+            content_length_reliable: None,
+            saw_rate_limit: false,
+            last_used_tick: tick,
+        });
+        profile.last_used_tick = tick;
+        profile
+    }
+
+    fn protocol_hint_for_origin(&mut self, origin: &str) -> Option<ProtocolFamily> {
+        if !self.enabled {
+            return None;
+        }
+        self.touch_profile(origin).protocol_hint
+    }
+
+    fn note_protocol(&mut self, origin: &str, protocol: ProtocolFamily) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).protocol_hint = Some(protocol);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_phi_ratio(&mut self, origin: &str, ratio: f64) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).phi_ratio = Some(ratio);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_h2_tuning(&mut self, origin: &str, tuning: ClientTuning) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).h2_tuning = Some(tuning);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_reuse_metrics(&mut self, origin: &str, reuse_rate: f64, handshake_ms: f64) {
+        if !self.enabled {
+            return;
+        }
+        let profile = self.touch_profile(origin);
+        profile.reuse_rate = Some(reuse_rate);
+        profile.handshake_ms = Some(handshake_ms);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_range_support(&mut self, origin: &str, supports_ranges: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).supports_ranges = Some(supports_ranges);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_content_length_reliable(&mut self, origin: &str, reliable: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).content_length_reliable = Some(reliable);
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn note_rate_limit(&mut self, origin: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.touch_profile(origin).saw_rate_limit = true;
+        self.prune_lru();
+        self.persist();
+    }
+
+    fn prune_lru(&mut self) {
+        while self.entries.len() > ORIGIN_MEMORY_CAPACITY {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, profile)| profile.last_used_tick)
+                .map(|(origin, _)| origin.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&lru_key);
+        }
+    }
+
+    fn hydrate_phi_ratios(&self) -> OriginPhiRatioStore {
+        let mut store = OriginPhiRatioStore::default();
+        for (origin, profile) in &self.entries {
+            if let Some(phi_ratio) = profile.phi_ratio {
+                store.entries.insert(
+                    origin.clone(),
+                    OriginPhiRatioEntry {
+                        ratio: phi_ratio,
+                        last_used_tick: profile.last_used_tick,
+                    },
+                );
+            }
+        }
+        store.usage_tick = self.usage_tick;
+        store
+    }
+
+    fn hydrate_h2_tunings(&self) -> OriginH2TuningStore {
+        let mut store = OriginH2TuningStore::default();
+        for (origin, profile) in &self.entries {
+            if let Some(mut tuning) = profile.h2_tuning {
+                tuning.source = H2TuningSource::OriginMemoryHint;
+                store.entries.insert(
+                    origin.clone(),
+                    OriginH2TuningEntry {
+                        tuning,
+                        last_used_tick: profile.last_used_tick,
+                    },
+                );
+            }
+        }
+        store.usage_tick = self.usage_tick;
+        store
+    }
+
+    fn memory_hit_for_origin(&self, origin: &str) -> bool {
+        self.enabled && self.entries.contains_key(origin)
+    }
 }
 
 impl OriginH2TuningStore {
@@ -654,6 +898,7 @@ pub struct DownloadEngine {
     pub last_memory_check: Cell<Instant>,
     origin_phi_ratios: RefCell<OriginPhiRatioStore>,
     origin_h2_tunings: RefCell<OriginH2TuningStore>,
+    origin_memory: Rc<RefCell<OriginMemoryStore>>,
     pub write_buffer_cap_bytes: Rc<Cell<usize>>,
     pub downloads: RefCell<Vec<DownloadHandle>>,
 }
@@ -819,8 +1064,12 @@ impl DownloadEngine {
         max_concurrent_tasks: usize,
         max_total_connections: usize,
         global_bandwidth_limit_bps: u64,
+        enable_origin_memory: bool,
     ) -> Rc<Self> {
         let configured_budget = max_total_connections.max(1);
+        let origin_memory = OriginMemoryStore::load_enabled(enable_origin_memory);
+        let origin_phi_ratios = origin_memory.hydrate_phi_ratios();
+        let origin_h2_tunings = origin_memory.hydrate_h2_tunings();
         Rc::new(Self {
             connections_per_download,
             max_concurrent_tasks,
@@ -830,8 +1079,9 @@ impl DownloadEngine {
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
             refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
             last_memory_check: Cell::new(Instant::now()),
-            origin_phi_ratios: RefCell::new(OriginPhiRatioStore::default()),
-            origin_h2_tunings: RefCell::new(OriginH2TuningStore::default()),
+            origin_phi_ratios: RefCell::new(origin_phi_ratios),
+            origin_h2_tunings: RefCell::new(origin_h2_tunings),
+            origin_memory: Rc::new(RefCell::new(origin_memory)),
             write_buffer_cap_bytes: Rc::new(Cell::new(4 * MB as usize)),
             downloads: RefCell::new(Vec::new()),
         })
@@ -1150,6 +1400,14 @@ async fn run_download_task_local(
     };
 
     task.total_size = total_size;
+    let origin = origin_key(&task.url);
+    let origin_memory_hit = engine.origin_memory.borrow().memory_hit_for_origin(&origin);
+    if !task.dry_run {
+        engine
+            .origin_memory
+            .borrow_mut()
+            .note_content_length_reliable(&origin, total_size > 0);
+    }
     if task.connections == 0 {
         task.connections = default_connections.max(1);
     }
@@ -1165,7 +1423,11 @@ async fn run_download_task_local(
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
-    let origin = origin_key(&task.url);
+    let protocol_hint = engine
+        .origin_memory
+        .borrow_mut()
+        .protocol_hint_for_origin(&origin)
+        .unwrap_or(ProtocolFamily::Other);
     let phi_max_ratio = engine.origin_phi_ratios.borrow_mut().ratio_for_origin(&origin);
     let shared_write_latency_ms = Rc::new(Cell::new(10.0));
     let write_buffer_cap_bytes = engine.write_buffer_cap_bytes.clone();
@@ -1235,6 +1497,7 @@ async fn run_download_task_local(
         *config.borrow_mut() = scaler_config;
     }
     let scaler = Scaler::from_config_handle(control.scaler_config());
+    scaler.last_protocol.set(protocol_hint);
     let scaler_engine = engine.clone();
 
     let handles = Rc::new(RefCell::new(Vec::<WorkerSlot>::new()));
@@ -1277,6 +1540,7 @@ async fn run_download_task_local(
         let worker = ConnectionWorker {
             connection_id: connection_id as u32,
             url: task.url.clone(),
+            origin: origin.clone(),
             file_path: file_path.clone(),
             log_path: log_path.clone(),
             coordinator_tx: work_tx.clone(),
@@ -1288,7 +1552,9 @@ async fn run_download_task_local(
             adaptive_minimum_steal_bytes: adaptive_minimum_steal_bytes.clone(),
             write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
             total_size,
+            origin_memory: engine.origin_memory.clone(),
             shared_write_latency_ms: shared_write_latency_ms.clone(),
+            ewma_connection_rtt_ms: Cell::new(200.0),
             metrics: metrics.clone(),
             client: http_client.clone(),
             index_state: index_state.clone(),
@@ -1431,6 +1697,10 @@ async fn run_download_task_local(
                             .origin_phi_ratios
                             .borrow_mut()
                             .update_origin_ratio(scaler_origin.clone(), next_phi_ratio);
+                        scaler_engine
+                            .origin_memory
+                            .borrow_mut()
+                            .note_phi_ratio(&scaler_origin, next_phi_ratio);
                         phi_ratio_recorded = true;
                         log_phase_a_info(
                             &scaler_log_path,
@@ -1540,6 +1810,7 @@ async fn run_download_task_local(
                 let worker = ConnectionWorker {
                     connection_id: connection_id_counter,
                     url: scaler_url.clone(),
+                    origin: scaler_origin.clone(),
                     file_path: scaler_file_path.clone(),
                     log_path: scaler_log_path.clone(),
                     coordinator_tx: scaler_work_tx.clone(),
@@ -1551,7 +1822,9 @@ async fn run_download_task_local(
                     adaptive_minimum_steal_bytes: scaler_adaptive_minimum_steal_bytes.clone(),
                     write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
                     total_size,
+                    origin_memory: scaler_engine.origin_memory.clone(),
                     shared_write_latency_ms: shared_write_latency_ms.clone(),
+                    ewma_connection_rtt_ms: Cell::new(200.0),
                     metrics: scaler_metrics.clone(),
                     client: scaler_http_client.clone(),
                     index_state: scaler_index_state.clone(),
@@ -1660,6 +1933,10 @@ async fn run_download_task_local(
             .origin_h2_tunings
             .borrow_mut()
             .update_origin_tuning(origin.clone(), learned_h2_tuning);
+        engine
+            .origin_memory
+            .borrow_mut()
+            .note_h2_tuning(&origin, learned_h2_tuning);
         coordinator.log(&format!(
             "phase_h2_tuning_update origin={} observed_rtt_ms={:.1} ewma_throughput_bps={:.0} max_active_connections_observed={} next_initial_h2_stream_window_bytes={} next_initial_h2_connection_window_bytes={} next_initial_h2_max_send_buffer_bytes={}",
             origin,
@@ -1671,6 +1948,14 @@ async fn run_download_task_local(
             learned_h2_tuning.http2_max_send_buffer_bytes,
         ));
     }
+    engine
+        .origin_memory
+        .borrow_mut()
+        .note_protocol(&origin, dominant_protocol);
+    engine
+        .origin_memory
+        .borrow_mut()
+        .note_reuse_metrics(&origin, scaler.reuse_rate.get(), scaler.ewma_handshake_ms.get());
     coordinator.log_summary(total_size);
     coordinator.log(&format!(
         "phase_protocol_summary http_mode={} dominant_protocol={} http1_requests={} http2_requests={} http_other_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} initial_h2_stream_window_bytes={} initial_h2_connection_window_bytes={} initial_h2_max_send_buffer_bytes={} configured_max_connections={} max_active_connections_observed={} h2_tuning_source={}",
@@ -1692,7 +1977,15 @@ async fn run_download_task_local(
         client_tuning.http2_max_send_buffer_bytes,
         client_tuning.expected_concurrency,
         metrics.max_active_connections_observed.get(),
-        client_tuning.source,
+        client_tuning.source.as_str(),
+    ));
+    coordinator.log(&format!(
+        "origin_memory_summary origin={} protocol_hint={} memory_hit={} reuse_rate={:.2} handshake_ms={:.1}",
+        origin,
+        protocol_hint.as_str(),
+        origin_memory_hit,
+        scaler.reuse_rate.get(),
+        scaler.ewma_handshake_ms.get(),
     ));
     coordinator.log(&format!(
         "phase_a_summary alpha={:.3} cv={:.3} ewma_rtt_ms={:.1} ewma_handshake_ms={:.1} reuse_rate={:.2} effective_add_threshold={:.2} slow_start_remaining={} reused_rtt_samples={}",
@@ -2261,6 +2554,7 @@ impl Coordinator {
 struct ConnectionWorker {
     connection_id: u32,
     url: String,
+    origin: String,
     file_path: PathBuf,
     log_path: PathBuf,
     coordinator_tx: mpsc::Sender<WorkRequest>,
@@ -2272,7 +2566,9 @@ struct ConnectionWorker {
     adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     write_buffer_cap_bytes: Rc<Cell<usize>>,
     total_size: u64,
+    origin_memory: Rc<RefCell<OriginMemoryStore>>,
     shared_write_latency_ms: Rc<Cell<f64>>,
+    ewma_connection_rtt_ms: Cell<f64>,
     metrics: Rc<SchedulerMetrics>,
     client: DownloadHttpClient,
     index_state: Rc<IndexStateMap>,
@@ -2315,6 +2611,15 @@ struct StartupProbe {
 enum RequestKind {
     Reused,
     Fresh,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RetryHint {
+    Immediate,
+    Backoff(u64),
+    ReduceWorkers(u64),
+    ShrinkRange(u64),
+    Abort,
 }
 
 impl ConnectionWorker {
@@ -2395,6 +2700,13 @@ impl ConnectionWorker {
     ) {
         let was_growth_probe = self.worker_control.pending_growth_probe.replace(false);
         let ttfb_ms = total_ttfb_ms as f64;
+        let prev_conn_rtt = self.ewma_connection_rtt_ms.get();
+        let updated_conn_rtt = if prev_conn_rtt <= 0.0 {
+            ttfb_ms
+        } else {
+            0.25 * ttfb_ms + 0.75 * prev_conn_rtt
+        };
+        self.ewma_connection_rtt_ms.set(updated_conn_rtt);
         let ewma_rtt_ms = self.scaler.ewma_rtt_ms.get();
         let threshold_ms = ewma_rtt_ms * 1.5;
         let kind = if ttfb_ms < threshold_ms {
@@ -2724,11 +3036,20 @@ impl ConnectionWorker {
             let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
 
             let remaining = end.saturating_sub(new_pos);
+            let prefetch_trigger_bytes = compute_prefetch_trigger_bytes(
+                remaining,
+                recent_speed_bps,
+                self.effective_prefetch_limit_bytes(),
+                self.scaler.last_protocol.get(),
+                self.ewma_connection_rtt_ms.get(),
+            );
+            SchedulerMetrics::update_max(&self.metrics.max_prefetch_trigger_bytes, prefetch_trigger_bytes);
             if should_prefetch(
                 remaining,
                 recent_speed_bps,
                 self.effective_prefetch_limit_bytes(),
                 self.scaler.last_protocol.get(),
+                self.ewma_connection_rtt_ms.get(),
             )
                 && prefetch_handle.is_none()
                 && prefetched_range.is_none()
@@ -2887,13 +3208,16 @@ impl ConnectionWorker {
             {
                 Ok(res) => res,
                 Err(e) => {
+                    let reason = format!("request error: {}", e);
+                    let retry_hint = classify_error_retry(&reason, false);
                     consecutive_failures = self
                         .handle_range_retry(
                             &range,
                             start,
                             end,
                             consecutive_failures,
-                            &format!("request error: {}", e),
+                            &reason,
+                            retry_hint,
                         )
                         .await?;
                     continue;
@@ -2908,6 +3232,12 @@ impl ConnectionWorker {
             record_protocol_request_metric(&self.metrics, protocol_family);
 
             if !response.status().is_success() {
+                if response.status().as_u16() == 429 {
+                    self.origin_memory
+                        .borrow_mut()
+                        .note_rate_limit(&self.origin);
+                    self.log_msg("origin signalled rate limit (429)").await;
+                }
                 consecutive_failures = self
                     .handle_range_retry(
                         &range,
@@ -2915,10 +3245,23 @@ impl ConnectionWorker {
                         end,
                         consecutive_failures,
                         &format!("HTTP error: {}", response.status()),
+                        classify_http_status_retry(response.status()),
                     )
                     .await?;
                 continue;
             }
+
+            let supports_ranges = response.status() == http::StatusCode::PARTIAL_CONTENT
+                || response.headers().contains_key(CONTENT_RANGE)
+                || response
+                    .headers()
+                    .get(ACCEPT_RANGES)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.eq_ignore_ascii_case("bytes"))
+                    .unwrap_or(false);
+            self.origin_memory
+                .borrow_mut()
+                .note_range_support(&self.origin, supports_ranges);
 
             let mut stream = response.into_body();
             let mut stream_failed = None::<String>;
@@ -3019,11 +3362,20 @@ impl ConnectionWorker {
                 }
 
                 let remaining = max_end.saturating_sub(new_pos);
+                let prefetch_trigger_bytes = compute_prefetch_trigger_bytes(
+                    remaining,
+                    recent_speed_bps,
+                    self.effective_prefetch_limit_bytes(),
+                    self.scaler.last_protocol.get(),
+                    self.ewma_connection_rtt_ms.get(),
+                );
+                SchedulerMetrics::update_max(&self.metrics.max_prefetch_trigger_bytes, prefetch_trigger_bytes);
                 if should_prefetch(
                     remaining,
                     recent_speed_bps,
                     self.effective_prefetch_limit_bytes(),
                     self.scaler.last_protocol.get(),
+                    self.ewma_connection_rtt_ms.get(),
                 )
                     && prefetch_handle.is_none()
                     && prefetched_range.is_none()
@@ -3032,8 +3384,8 @@ impl ConnectionWorker {
                     SchedulerMetrics::add(&self.metrics.prefetch_requests, 1);
                     prefetch_handle = Some(self.spawn_prefetch_request());
                     self.log_msg(&format!(
-                        "prefetch trigger remaining={} recent_speed_bps={:.0}",
-                        remaining, recent_speed_bps
+                        "prefetch trigger remaining={} trigger_bytes={} recent_speed_bps={:.0}",
+                        remaining, prefetch_trigger_bytes, recent_speed_bps
                     ))
                     .await;
                 }
@@ -3091,6 +3443,7 @@ impl ConnectionWorker {
                     .await;
                     self.reset_pending_write_target(&mut pending_write);
                 } else {
+                    let retry_hint = classify_error_retry(&reason, made_progress_this_attempt);
                     consecutive_failures = self
                         .handle_range_retry(
                             &range,
@@ -3098,6 +3451,7 @@ impl ConnectionWorker {
                             end,
                             consecutive_failures,
                             &reason,
+                            retry_hint,
                         )
                         .await?;
                 }
@@ -3154,11 +3508,12 @@ impl ConnectionWorker {
         current_end: u64,
         consecutive_failures: u32,
         reason: &str,
+        retry_hint: RetryHint,
     ) -> Result<u32> {
         let next_failures = consecutive_failures.saturating_add(1);
         SchedulerMetrics::add(&self.metrics.retry_attempts, 1);
 
-        if next_failures > MAX_RANGE_RETRIES {
+        if matches!(retry_hint, RetryHint::Abort) || next_failures > MAX_RANGE_RETRIES {
             return Err(anyhow!(
                 "range#{} failed after {} retries at bytes {}..{}: {}",
                 range.id,
@@ -3169,11 +3524,24 @@ impl ConnectionWorker {
             ));
         }
 
-        let delay_ms = retry_delay_ms(next_failures);
+        let delay_ms = match retry_hint {
+            RetryHint::Immediate => 0,
+            RetryHint::Backoff(ms) => ms,
+            RetryHint::ReduceWorkers(ms) => {
+                self.scaler.skip_growth_sample.set(true);
+                self.scaler
+                    .slow_start_remaining
+                    .set(self.scaler.slow_start_remaining.get().saturating_add(1));
+                ms
+            }
+            RetryHint::ShrinkRange(ms) => ms,
+            RetryHint::Abort => 0,
+        };
         SchedulerMetrics::add(&self.metrics.retry_wait_ms, delay_ms);
         self.log_msg(&format!(
-            "{}; retry {}/{} after {}ms on range#{} bytes={}..{}",
+            "{}; retry_hint={:?} retry {}/{} after {}ms on range#{} bytes={}..{}",
             reason,
+            retry_hint,
             next_failures,
             MAX_RANGE_RETRIES,
             delay_ms,
@@ -3482,16 +3850,35 @@ fn estimate_speed_bps(started_at: Instant, start_offset: u64, current_offset: u6
     current_offset.saturating_sub(start_offset) as f64 / elapsed
 }
 
+fn compute_prefetch_trigger_bytes(
+    remaining_bytes: u64,
+    recent_speed_bps: f64,
+    borrow_limit_bytes: u64,
+    protocol: ProtocolFamily,
+    worker_rtt_ms: f64,
+) -> u64 {
+    let handshake_ms = protocol_prefetch_handshake_ms(protocol).max(worker_rtt_ms.round() as u64);
+    let handshake_bytes = ((recent_speed_bps * (handshake_ms as f64 / 1000.0)).ceil())
+        .max((LIVE_PREFETCH_MIN_MB * MB) as f64) as u64;
+    let _ = remaining_bytes;
+    handshake_bytes.max(borrow_limit_bytes)
+}
+
 fn should_prefetch(
     remaining_bytes: u64,
     recent_speed_bps: f64,
     borrow_limit_bytes: u64,
     protocol: ProtocolFamily,
+    worker_rtt_ms: f64,
 ) -> bool {
-    let handshake_ms = protocol_prefetch_handshake_ms(protocol);
-    let handshake_bytes = ((recent_speed_bps * (handshake_ms as f64 / 1000.0)).ceil())
-        .max((LIVE_PREFETCH_MIN_MB * MB) as f64) as u64;
-    remaining_bytes <= handshake_bytes.max(borrow_limit_bytes)
+    remaining_bytes
+        <= compute_prefetch_trigger_bytes(
+            remaining_bytes,
+            recent_speed_bps,
+            borrow_limit_bytes,
+            protocol,
+            worker_rtt_ms,
+        )
 }
 
 fn update_scaler_signal_stats(scaler: &Rc<Scaler>, sample_bps: f64) -> (f64, f64) {
@@ -3612,6 +3999,19 @@ fn origin_key(url: &str) -> String {
     url.to_string()
 }
 
+fn origin_memory_path() -> PathBuf {
+    if let Ok(xdg_cache_home) = std::env::var("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg_cache_home).join("tur").join("origin-memory.bin");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("tur")
+            .join("origin-memory.bin");
+    }
+    PathBuf::from(".tur-origin-memory.bin")
+}
+
 async fn update_reuse_health(
     scaler: &Rc<Scaler>,
     url: &str,
@@ -3694,10 +4094,36 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn retry_delay_ms(attempt: u32) -> u64 {
-    let shift = attempt.saturating_sub(1).min(4);
-    let scaled = RETRY_BASE_DELAY_MS.saturating_mul(1_u64 << shift);
-    scaled.min(RETRY_MAX_DELAY_MS)
+fn classify_http_status_retry(status: http::StatusCode) -> RetryHint {
+    match status.as_u16() {
+        429 => RetryHint::ReduceWorkers(RETRY_MAX_DELAY_MS),
+        503 => RetryHint::Immediate,
+        500..=599 => RetryHint::Backoff(RETRY_BASE_DELAY_MS.saturating_mul(2)),
+        416 => RetryHint::Abort,
+        _ => RetryHint::Backoff(RETRY_BASE_DELAY_MS),
+    }
+}
+
+fn classify_error_retry(reason: &str, made_progress: bool) -> RetryHint {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("tls") || reason.contains("ssl") || reason.contains("handshake") {
+        return RetryHint::ReduceWorkers(RETRY_MAX_DELAY_MS);
+    }
+    if reason.contains("connection reset") || reason.contains("broken pipe") {
+        return if made_progress {
+            RetryHint::ShrinkRange(RETRY_BASE_DELAY_MS)
+        } else {
+            RetryHint::ReduceWorkers(RETRY_BASE_DELAY_MS.saturating_mul(4))
+        };
+    }
+    if reason.contains("timed out") || reason.contains("timeout") {
+        return if made_progress {
+            RetryHint::ShrinkRange(RETRY_BASE_DELAY_MS)
+        } else {
+            RetryHint::Backoff(RETRY_BASE_DELAY_MS.saturating_mul(3))
+        };
+    }
+    RetryHint::Backoff(RETRY_BASE_DELAY_MS)
 }
 
 fn valid_slice_mask(total_size: u64, bucket_idx: usize) -> u8 {
@@ -3886,7 +4312,7 @@ fn compute_http2_client_tuning(expected_concurrency: usize) -> ClientTuning {
         http2_stream_window_bytes: stream_window_bytes,
         http2_connection_window_bytes: connection_window_bytes,
         http2_max_send_buffer_bytes: max_send_buffer_bytes,
-        source: "default",
+        source: H2TuningSource::Default,
     }
 }
 
@@ -3913,7 +4339,7 @@ fn learn_http2_client_tuning(
         http2_stream_window_bytes: stream_window_bytes,
         http2_connection_window_bytes: connection_window_bytes,
         http2_max_send_buffer_bytes: max_send_buffer_bytes,
-        source: "learned-origin",
+        source: H2TuningSource::LearnedOrigin,
     }
 }
 
@@ -4129,7 +4555,7 @@ mod tests {
         store.update_origin_tuning("https://example.com:443".to_string(), tuning);
         assert_eq!(
             store.current_tuning("https://example.com:443").unwrap().source,
-            "learned-origin"
+            H2TuningSource::LearnedOrigin
         );
 
         for idx in 0..ORIGIN_PHI_RATIO_CAPACITY {

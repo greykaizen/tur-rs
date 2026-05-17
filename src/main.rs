@@ -49,6 +49,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         tasks_limit,
         max_total_connections,
         global_bandwidth_limit_bps,
+        !cli.no_origin_memory,
     );
     tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {
@@ -100,6 +101,7 @@ async fn run_headless(cli: Cli) -> Result<()> {
         tasks_limit,
         max_total_connections,
         global_bandwidth_limit_bps,
+        !cli.no_origin_memory,
     );
     tokio::task::spawn_local(async move {
         if let Err(e) = engine.run(engine_rx, engine_cmd_tx, event_tx).await {

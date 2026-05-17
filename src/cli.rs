@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(long)]
     pub log_root: Option<String>,
 
+    /// Disable persisted origin behavior memory
+    #[arg(long, default_value_t = false)]
+    pub no_origin_memory: bool,
+
     /// System-wide ceiling for active download connections
     #[arg(long, default_value_t = 32)]
     pub max_total_connections: usize,
