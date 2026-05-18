@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use ::http::header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, USER_AGENT};
+use ::http::header::{
+    ACCEPT, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    LOCATION, RANGE, USER_AGENT,
+};
 use ::http::{Method, Request, Uri, Version};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
@@ -104,7 +107,140 @@ use http::{
 };
 use origin_memory::{
     origin_key, ClientTuning, H2TuningSource, OriginH2TuningStore, OriginMemoryStore,
+    SessionRequirementField,
 };
+
+/// Build an `http::HeaderMap` from a `DownloadTask`'s request context.
+/// Returns `None` if there are no custom headers to add.
+fn build_request_headers(task: &DownloadTask) -> Option<::http::HeaderMap> {
+    let ctx = task.request_context.as_ref()?;
+    let mut headers = ::http::HeaderMap::new();
+
+    // Custom headers
+    for (name, value) in &ctx.headers {
+        if let (Ok(n), Ok(v)) = (
+            ::http::HeaderName::from_bytes(name.as_bytes()),
+            ::http::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
+    }
+
+    // Authorization
+    if let Some(ref auth) = ctx.auth {
+        if let Ok(v) = ::http::HeaderValue::from_str(auth) {
+            headers.insert(::http::header::AUTHORIZATION, v);
+        }
+    }
+
+    // Referer
+    if let Some(ref referer) = ctx.referer {
+        if let Ok(v) = ::http::HeaderValue::from_str(referer) {
+            headers.insert(::http::header::REFERER, v);
+        }
+    }
+
+    // User-Agent override
+    if let Some(ref ua) = ctx.user_agent {
+        if let Ok(v) = ::http::HeaderValue::from_str(ua) {
+            headers.insert(::http::header::USER_AGENT, v);
+        }
+    }
+
+    // Cookies — convert Vec<CookieEntry> to Cookie header
+    if let Some(ref cookies) = ctx.cookies {
+        if !cookies.is_empty() {
+            let value = cookies
+                .iter()
+                .map(|c| c.to_request_value())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Ok(v) = ::http::HeaderValue::from_str(&value) {
+                headers.insert(::http::header::COOKIE, v);
+            }
+        }
+    }
+
+    if headers.is_empty() { None } else { Some(headers) }
+}
+
+/// Detect whether a response body indicates a challenge/interstitial page
+/// rather than a real file response.
+pub(super) fn classify_response_body(body_bytes: &[u8]) -> Option<ChallengeKind> {
+    // Fast path: short circuit for empty or obviously binary
+    if body_bytes.len() < 64 {
+        return None;
+    }
+
+    // Check if the body looks like HTML
+    let sample = body_bytes.get(..4096).unwrap_or(body_bytes);
+    let as_str = std::str::from_utf8(sample).ok()?;
+    let lower = as_str.to_ascii_lowercase();
+
+    if !lower.contains("<html") && !lower.contains("<!doc") {
+        return None; // Not HTML — likely a real binary response
+    }
+
+    // Cloudflare challenge detection
+    if lower.contains("cloudflare")
+        && (lower.contains("challenge")
+            || lower.contains("attention required")
+            || lower.contains("cf-browser-verification"))
+    {
+        return Some(ChallengeKind::CloudflareChallenge);
+    }
+
+    // Generic challenge/interstitial
+    if lower.contains("challenge") && lower.contains("captcha") {
+        return Some(ChallengeKind::CaptchaChallenge);
+    }
+
+    if lower.contains("just a moment...")
+        || (lower.contains("checking your browser") && lower.contains("ddo"))
+    {
+        return Some(ChallengeKind::BrowserCheck);
+    }
+
+    // Generic interstitial (login wall, terms page, etc.)
+    if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate")
+        && (lower.contains("continue") || lower.contains("proceed"))
+    {
+        return Some(ChallengeKind::AuthInterstitial);
+    }
+
+    // The response is HTML but doesn't match known patterns — flag as unexpected HTML
+    Some(ChallengeKind::UnexpectedHtml)
+}
+
+/// Classification of non-file responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeKind {
+    CloudflareChallenge,
+    CaptchaChallenge,
+    BrowserCheck,
+    AuthInterstitial,
+    UnexpectedHtml,
+}
+
+impl ChallengeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudflareChallenge => "cloudflare-challenge",
+            Self::CaptchaChallenge => "captcha-challenge",
+            Self::BrowserCheck => "browser-check",
+            Self::AuthInterstitial => "auth-interstitial",
+            Self::UnexpectedHtml => "unexpected-html",
+        }
+    }
+
+    /// Returns true if the challenge likely requires a browser-assisted handoff.
+    pub fn requires_browser_session(self) -> bool {
+        matches!(
+            self,
+            Self::CloudflareChallenge | Self::CaptchaChallenge | Self::BrowserCheck
+        )
+    }
+}
 use persistence::{ensure_parent_dir, load_snapshot, log_path, metadata_path, persist_snapshot, unix_time_ms};
 use ranges::{is_tail_phase_bytes, snapshot_downloaded};
 use runtime::{OriginPhiRatioStore, RuntimeControl, WorkerControl, WorkerSlot};
@@ -204,8 +340,9 @@ async fn run_download_task_local(
             }
             cnt
         };
+        let head_extra_headers = build_request_headers(&task);
         let head_fut =
-            send_request_follow_redirects(&head_client, Method::HEAD, &head_url, None);
+            send_request_follow_redirects(&head_client, Method::HEAD, &head_url, None, head_extra_headers.as_ref());
         tokio::pin!(head_fut);
         tokio::pin!(conn_fut);
 
@@ -379,10 +516,11 @@ async fn run_download_task_local(
             .await;
         return Ok(());
     }
+    // Build request_headers once, used by all workers and the scaler spawn
+    let request_headers = build_request_headers(&task);
     scaler.n_active.set(initial_connections);
     record_max_active_connections(&metrics, initial_connections);
-
-    for connection_id in 0..initial_connections {
+        for connection_id in 0..initial_connections {
         let worker_control = WorkerControl::new(connection_id as u32);
         worker_control.pending_growth_probe.set(false);
         let worker = ConnectionWorker {
@@ -410,6 +548,7 @@ async fn run_download_task_local(
             scaler: scaler.clone(),
             storage_config: engine.storage_config.clone(),
             h3_client: h3_client.clone(),
+            request_headers: request_headers.clone(),
         };
 
         let handle = tokio::task::spawn_local(async move {
@@ -715,6 +854,7 @@ async fn run_download_task_local(
                     scaler: scaler_for_task.clone(),
                     storage_config: scaler_engine.storage_config.clone(),
                     h3_client: scaler_h3_client.clone(),
+                    request_headers: request_headers.clone(),
                 };
                 connection_id_counter += 1;
                 let handle = tokio::task::spawn_local(async move {
@@ -845,6 +985,55 @@ async fn run_download_task_local(
         .origin_memory
         .borrow_mut()
         .note_reuse_metrics(&origin, scaler.reuse_rate.get(), scaler.ewma_handshake_ms.get());
+
+    // Check if the download was aborted due to a challenge/interstitial page.
+    if let Some(challenge_reason) = control.challenge_reason.borrow().clone() {
+        let _ = event_tx
+            .send(EngineEvent::StatusChanged(
+                task.id,
+                DownloadStatus::Error(challenge_reason),
+            ))
+            .await;
+        return Ok(());
+    }
+
+    // Infer session requirements from what was actually used in this download.
+    // This populates origin memory so future downloads can warn or suggest flags.
+    if let Some(ref ctx) = task.request_context {
+        if ctx.cookies.as_ref().map_or(false, |c| !c.is_empty()) {
+            engine
+                .origin_memory
+                .borrow_mut()
+                .note_session_requirement(&origin, SessionRequirementField::Cookies, true);
+        }
+        if ctx.auth.is_some() {
+            engine
+                .origin_memory
+                .borrow_mut()
+                .note_session_requirement(&origin, SessionRequirementField::Auth, true);
+        }
+        if ctx.referer.is_some() {
+            engine
+                .origin_memory
+                .borrow_mut()
+                .note_session_requirement(&origin, SessionRequirementField::Referer, true);
+        }
+    }
+
+    // Log session memory info (Phase 3: session-aware diagnostics)
+    if let Some(session_info) = engine.origin_memory.borrow().session_info_for_origin(&origin) {
+        coordinator.log(&format!(
+            "session_memory origin={} cookies_used={:?} auth_used={:?} referer_used={:?} challenge_detected={:?} challenge_kind={} saw_rate_limit={}",
+            origin,
+            session_info.cookies_used,
+            session_info.auth_used,
+            session_info.referer_used,
+            session_info.challenge_detected,
+            session_info.challenge_kind.as_deref().unwrap_or("none"),
+            session_info.saw_rate_limit,
+        ));
+    }
+
     coordinator.log_summary(total_size);
     coordinator.log(&format!(
         "phase_protocol_summary http_mode={} dominant_protocol={} http1_requests={} http2_requests={} http_other_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} initial_h2_stream_window_bytes={} initial_h2_connection_window_bytes={} initial_h2_max_send_buffer_bytes={} configured_max_connections={} max_active_connections_observed={} h2_tuning_source={}",

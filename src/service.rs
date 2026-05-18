@@ -40,6 +40,7 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 use uuid::Uuid;
 
 use crate::engine::{
@@ -49,7 +50,291 @@ use crate::engine::{
 use crate::storage::StorageConfig;
 
 // ---------------------------------------------------------------------------
-// Public types
+// Session / context types for session-aware downloading (0.8.0)
+// ---------------------------------------------------------------------------
+
+/// A single cookie entry for use with session-aware downloads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CookieEntry {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub expires: Option<String>,
+}
+
+impl CookieEntry {
+    pub fn new(name: impl Into<String>, value: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            domain: domain.into(),
+            path: "/".into(),
+            secure: false,
+            expires: None,
+        }
+    }
+
+    /// Parse a `Set-Cookie` header value into a `CookieEntry`,
+    /// using the request URL's host as the default domain.
+    pub fn from_set_cookie(header: &str, request_url: &Url) -> Option<Self> {
+        let mut name = String::new();
+        let mut value = String::new();
+        let mut domain = request_url.host_str()?.to_string();
+        let mut path = "/".to_string();
+        let mut secure = false;
+        let mut expires = None;
+
+        let mut parts = header.split(';');
+        if let Some(first) = parts.next() {
+            let eq_pos = first.find('=')?;
+            name = first[..eq_pos].trim().to_string();
+            value = first[eq_pos + 1..].trim().to_string();
+        }
+
+        for part in parts {
+            let part = part.trim();
+            if let Some(eq_pos) = part.find('=') {
+                let key = part[..eq_pos].trim().to_ascii_lowercase();
+                let val = part[eq_pos + 1..].trim().to_string();
+                match key.as_str() {
+                    "domain" => domain = val.trim_start_matches('.').to_string(),
+                    "path" => path = val,
+                    "expires" => expires = Some(val),
+                    _ => {}
+                }
+            } else if part.eq_ignore_ascii_case("secure") {
+                secure = true;
+            }
+        }
+
+        Some(Self { name, value, domain, path, secure, expires })
+    }
+
+    /// Format as a `Cookie` request header value.
+    pub fn to_request_value(&self) -> String {
+        format!("{}={}", self.name, self.value)
+    }
+}
+
+/// An in-memory cookie store.
+#[derive(Debug, Clone, Default)]
+pub struct CookieJar {
+    cookies: Vec<CookieEntry>,
+}
+
+impl CookieJar {
+    pub fn new() -> Self {
+        Self { cookies: Vec::new() }
+    }
+
+    /// Add (or replace) a cookie.
+    pub fn insert(&mut self, cookie: CookieEntry) {
+        self.cookies.retain(|c| {
+            !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path)
+        });
+        self.cookies.push(cookie);
+    }
+
+    /// Return cookies that match the given URL.
+    pub fn match_url(&self, url: &Url) -> Vec<&CookieEntry> {
+        let host = url.host_str().unwrap_or("");
+        let path = url.path();
+        self.cookies.iter().filter(|c| {
+            let domain_match = host == c.domain || host.ends_with(&format!(".{}", c.domain));
+            let path_match = path.starts_with(&c.path);
+            let secure_ok = !c.secure || url.scheme() == "https";
+            domain_match && path_match && secure_ok
+        }).collect()
+    }
+
+    /// Format all matching cookies as a single `Cookie` header value.
+    pub fn header_value_for_url(&self, url: &Url) -> Option<String> {
+        let matched = self.match_url(url);
+        if matched.is_empty() {
+            return None;
+        }
+        Some(matched.iter().map(|c| c.to_request_value()).collect::<Vec<_>>().join("; "))
+    }
+
+    /// Import cookies from a string in Netscape cookie-file format or simple "name=value" lines.
+    pub fn import_lines(&mut self, lines: &str, default_domain: &str) {
+        for line in lines.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 7 {
+                let domain = parts[0].trim_start_matches('.');
+                let path = parts[2];
+                let secure = parts[3] == "TRUE";
+                let name = parts[5];
+                let value = parts[6];
+                self.insert(CookieEntry {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    domain: domain.to_string(),
+                    path: path.to_string(),
+                    secure,
+                    expires: None,
+                });
+            } else if let Some(eq_pos) = line.find('=') {
+                let name = line[..eq_pos].trim();
+                let value = line[eq_pos + 1..].trim();
+                if !name.is_empty() {
+                    self.insert(CookieEntry::new(name, value, default_domain));
+                }
+            }
+        }
+    }
+
+    /// Export cookies as a string (Netscape format for reuse).
+    pub fn export_netscape(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# Netscape HTTP Cookie File\n");
+        out.push_str("# https://curl.se/rfc/cookie_spec.html\n");
+        out.push_str("# This file was generated by tur-rs\n");
+        for c in &self.cookies {
+            let secure = if c.secure { "TRUE" } else { "FALSE" };
+            let expires = c.expires.as_deref().unwrap_or("0");
+            out.push_str(&format!(
+                "{}\tTRUE\t{}\t{}\t{}\t{}\t{}\n",
+                c.domain, c.path, secure, expires, c.name, c.value
+            ));
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize { self.cookies.len() }
+    pub fn is_empty(&self) -> bool { self.cookies.is_empty() }
+}
+
+/// Request-level context for authenticated / session-aware downloading.
+///
+/// This is the primary input for browser-assisted handoff: a GUI frontend
+/// can acquire cookies, tokens, and headers from a browser context and pass
+/// them here for `tur-rs` to use during the actual download.
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    /// Custom HTTP headers to attach to every request for this download.
+    pub headers: HashMap<String, String>,
+    /// Authorization header value (e.g. `"Bearer eyJ..."`).
+    pub auth: Option<String>,
+    /// Referer URL.
+    pub referer: Option<String>,
+    /// User-Agent override.
+    pub user_agent: Option<String>,
+    /// Cookies scoped to this download's origin.
+    pub cookies: Option<Vec<CookieEntry>>,
+}
+
+impl RequestContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a custom header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set the Authorization header (e.g. `"Bearer eyJ..."`).
+    pub fn auth(mut self, value: impl Into<String>) -> Self {
+        self.auth = Some(value.into());
+        self
+    }
+
+    /// Set the Referer header.
+    pub fn referer(mut self, url: impl Into<String>) -> Self {
+        self.referer = Some(url.into());
+        self
+    }
+
+    /// Override the User-Agent.
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+
+    /// Attach cookies for this download's origin.
+    pub fn cookies(mut self, cookies: Vec<CookieEntry>) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+}
+
+/// A bundle of session context for browser-assisted handoff.
+///
+/// This is the primary handoff type for GUI/frontend integration:
+/// a web view or Tauri app can acquire cookies, headers, and tokens
+/// from a browser session and pass them here for `tur-rs` to use.
+///
+/// Convert to a [`RequestContext`] via [`SessionContext::to_request_context`].
+#[derive(Debug, Clone, Default)]
+pub struct SessionContext {
+    pub cookies: Vec<CookieEntry>,
+    pub headers: HashMap<String, String>,
+    pub auth: Option<String>,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+impl SessionContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert this session context into a [`RequestContext`] for use with a download.
+    pub fn to_request_context(&self) -> RequestContext {
+        RequestContext {
+            headers: self.headers.clone(),
+            auth: self.auth.clone(),
+            referer: self.referer.clone(),
+            user_agent: self.user_agent.clone(),
+            cookies: if self.cookies.is_empty() {
+                None
+            } else {
+                Some(self.cookies.clone())
+            },
+        }
+    }
+
+    /// Builder: add a cookie.
+    pub fn cookie(mut self, entry: CookieEntry) -> Self {
+        self.cookies.push(entry);
+        self
+    }
+
+    /// Builder: add a custom header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Builder: set Authorization (e.g. `"Bearer eyJ..."`).
+    pub fn auth(mut self, value: impl Into<String>) -> Self {
+        self.auth = Some(value.into());
+        self
+    }
+
+    /// Builder: set Referer.
+    pub fn referer(mut self, url: impl Into<String>) -> Self {
+        self.referer = Some(url.into());
+        self
+    }
+
+    /// Builder: override User-Agent.
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public config & request types
 // ---------------------------------------------------------------------------
 
 /// Configuration for a [`TurService`] instance.
@@ -57,19 +342,14 @@ use crate::storage::StorageConfig;
 pub struct ServiceConfig {
     /// Per-download initial connection count (default: 8).
     pub connections_per_download: usize,
-
     /// Maximum concurrent downloads (default: 3).
     pub max_concurrent_tasks: usize,
-
     /// System-wide ceiling for active download connections (default: 32).
     pub max_total_connections: usize,
-
     /// Global bandwidth cap in bps; 0 disables (default: 0).
     pub global_bandwidth_limit_bps: u64,
-
     /// Enable persisted origin behaviour memory (default: true).
     pub enable_origin_memory: bool,
-
     /// Platform storage tuning options.
     pub storage_config: StorageConfig,
 }
@@ -114,6 +394,8 @@ pub struct DownloadRequest {
     pub schedule_mode: Option<ScheduleMode>,
     pub dry_run: bool,
     pub dry_run_size_mb: Option<u64>,
+    /// Optional request context for session-aware downloading.
+    pub request_context: Option<RequestContext>,
 }
 
 impl DownloadRequest {
@@ -132,6 +414,7 @@ impl DownloadRequest {
             schedule_mode: None,
             dry_run: false,
             dry_run_size_mb: None,
+            request_context: None,
         }
     }
 
@@ -200,9 +483,35 @@ impl DownloadRequest {
         self.dry_run_size_mb = Some(mb);
         self
     }
+
+    /// Attach request context (auth, headers, cookies, referer) for
+    /// session-aware downloading (builder style).
+    pub fn context(mut self, ctx: RequestContext) -> Self {
+        self.request_context = Some(ctx);
+        self
+    }
+
+    /// Convenience: set a Bearer token for Authorization.
+    pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.request_context.get_or_insert_with(RequestContext::new)
+            .auth = Some(format!("Bearer {}", token.into()));
+        self
+    }
+
+    /// Convenience: set the Referer header.
+    pub fn referer(mut self, url: impl Into<String>) -> Self {
+        self.request_context.get_or_insert_with(RequestContext::new)
+            .referer = Some(url.into());
+        self
+    }
+
+    /// Convenience: add a custom header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.request_context.get_or_insert_with(RequestContext::new)
+            .headers.insert(name.into(), value.into());
+        self
+    }
 }
-
-
 
 /// Events emitted during a download's lifecycle.
 ///
@@ -257,26 +566,17 @@ impl DownloadHandle {
 
     /// Pause the download (connections are released, state kept in memory).
     pub async fn pause(&self) {
-        let _ = self
-            .engine_tx
-            .send(EngineCommand::Stop(self.id))
-            .await;
+        let _ = self.engine_tx.send(EngineCommand::Stop(self.id)).await;
     }
 
     /// Resume a paused download.
     pub async fn resume(&self) {
-        let _ = self
-            .engine_tx
-            .send(EngineCommand::Resume(self.id))
-            .await;
+        let _ = self.engine_tx.send(EngineCommand::Resume(self.id)).await;
     }
 
     /// Cancel and persist the download state to disk.
     pub async fn cancel(&self) {
-        let _ = self
-            .engine_tx
-            .send(EngineCommand::Cancel(self.id))
-            .await;
+        let _ = self.engine_tx.send(EngineCommand::Cancel(self.id)).await;
     }
 }
 
@@ -293,6 +593,7 @@ pub struct TurService {
     engine_tx: mpsc::Sender<EngineCommand>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     handles: Rc<std::cell::RefCell<HashMap<Uuid, mpsc::UnboundedSender<DownloadUpdate>>>>,
+    cookie_jar: std::cell::RefCell<CookieJar>,
 }
 
 impl std::fmt::Debug for TurService {
@@ -352,29 +653,46 @@ impl TurService {
             engine_tx,
             shutdown_tx: Some(shutdown_tx),
             handles,
+            cookie_jar: std::cell::RefCell::new(CookieJar::new()),
         })
+    }
+
+    /// Return a reference to the internal cookie jar for inspection or import.
+    pub fn cookie_jar(&self) -> std::cell::Ref<'_, CookieJar> {
+        self.cookie_jar.borrow()
+    }
+
+    /// Return a mutable reference to the cookie jar for importing cookies.
+    pub fn cookie_jar_mut(&self) -> std::cell::RefMut<'_, CookieJar> {
+        self.cookie_jar.borrow_mut()
     }
 
     /// Submit a download request and get back a [`DownloadHandle`].
     ///
     /// The download is queued immediately and will start as soon as the
     /// engine has capacity.
+    ///
+    /// If the request includes a [`RequestContext`], its cookies are merged
+    /// into the service-wide cookie jar, and the context is threaded through
+    /// to every HTTP request made for this download.
     pub async fn add_download(&self, request: DownloadRequest) -> Result<DownloadHandle> {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<DownloadUpdate>();
 
-        let filename = request
-            .filename
-            .clone()
-            .unwrap_or_else(|| {
-                request
-                    .url
-                    .split('/')
-                    .last()
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
+        let filename = request.filename.clone().unwrap_or_else(|| {
+            request.url.split('/').last().unwrap_or("unknown").to_string()
+        });
 
-        let task = DownloadTask {
+        // Merge per-request cookies into the service cookie jar
+        if let Some(ref ctx) = request.request_context {
+            if let Some(ref cookies) = ctx.cookies {
+                let mut jar = self.cookie_jar.borrow_mut();
+                for c in cookies {
+                    jar.insert(c.clone());
+                }
+            }
+        }
+
+        let mut task = DownloadTask {
             id: Uuid::new_v4(),
             url: request.url,
             filename,
@@ -389,13 +707,30 @@ impl TurService {
             borrow_limit_mb: request.borrow_limit_mb.unwrap_or(2),
             min_connections: request.min_connections.unwrap_or(1),
             max_connections: request.max_connections.unwrap_or(16),
-            per_download_bandwidth_limit_bps: request
-                .per_download_bandwidth_limit_bps
-                .unwrap_or(0),
+            per_download_bandwidth_limit_bps: request.per_download_bandwidth_limit_bps.unwrap_or(0),
             schedule_mode: request.schedule_mode.unwrap_or(ScheduleMode::Equal),
             http_mode: request.http_mode.unwrap_or(HttpMode::Auto),
             log_root: None,
+            request_context: request.request_context,
         };
+
+        // Merge service cookie jar cookies into the task's request context.
+        // Service-level cookies are applied by URL match.
+        if let Ok(url) = url::Url::parse(&task.url) {
+            let jar = self.cookie_jar.borrow();
+            let jar_cookies: Vec<CookieEntry> = jar.match_url(&url).into_iter().cloned().collect();
+            if !jar_cookies.is_empty() {
+                let ctx = task.request_context.get_or_insert_with(RequestContext::new);
+                let mut existing = ctx.cookies.take().unwrap_or_default();
+                // Only add service cookies that don't shadow existing per-request cookies
+                for c in jar_cookies {
+                    if !existing.iter().any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path) {
+                        existing.push(c);
+                    }
+                }
+                ctx.cookies = Some(existing);
+            }
+        }
 
         let id = task.id;
         self.handles.borrow_mut().insert(id, event_tx);
@@ -409,6 +744,16 @@ impl TurService {
             engine_tx: self.engine_tx.clone(),
             event_rx,
         })
+    }
+
+    /// Import cookies from a Netscape-format cookie file into the service cookie jar.
+    ///
+    /// The domain is extracted from each line; a fallback domain can be used
+    /// for cookies with no explicit domain.
+    pub async fn import_cookie_file(&self, path: &PathBuf) -> Result<()> {
+        let contents = tokio::fs::read_to_string(path).await?;
+        self.cookie_jar.borrow_mut().import_lines(&contents, "");
+        Ok(())
     }
 
     /// Shut down the service gracefully.
@@ -445,7 +790,6 @@ impl TurService {
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    // Signal all active downloads to stop gracefully
                     let ids: Vec<Uuid> = handles.borrow().keys().copied().collect();
                     for id in ids {
                         let _ = engine_tx.send(EngineCommand::Stop(id)).await;

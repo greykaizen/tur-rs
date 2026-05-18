@@ -90,4 +90,20 @@ pub struct Cli {
     /// Number of worker threads for the async runtime; 1 = single-threaded
     #[arg(long, default_value_t = 1)]
     pub runtime_threads: usize,
+
+    /// Custom HTTP header(s) to include with every request (e.g. "X-API-Key: secret")
+    #[arg(long, num_args = 0.., value_name = "HEADER")]
+    pub header: Vec<String>,
+
+    /// Referer URL to include with every request
+    #[arg(long)]
+    pub referer: Option<String>,
+
+    /// Bearer token for Authorization header (e.g. "eyJ...")
+    #[arg(long = "auth-bearer")]
+    pub auth_bearer: Option<String>,
+
+    /// Path to a Netscape-format cookie file to import
+    #[arg(long = "cookie-file")]
+    pub cookie_file: Option<String>,
 }

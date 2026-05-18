@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::http::compute_http2_client_tuning;
+use crate::engine::http::{extract_origin, strip_sensitive_headers};
 
 #[test]
 fn memory_budget_scales_by_available_memory() {
@@ -81,4 +82,171 @@ fn learned_http2_tuning_is_origin_scoped_and_pruned() {
         );
     }
     assert!(store.len() <= ORIGIN_PHI_RATIO_CAPACITY);
+}
+
+#[test]
+fn extract_origin_parses_scheme_host_port() {
+    assert_eq!(
+        extract_origin("https://example.com/file.zip"),
+        "https://example.com:443"
+    );
+    assert_eq!(
+        extract_origin("http://example.com:8080/file.zip"),
+        "http://example.com:8080"
+    );
+    assert_eq!(
+        extract_origin("https://cdn.example.com/path?a=1"),
+        "https://cdn.example.com:443"
+    );
+    assert_eq!(extract_origin("not a url"), "");
+    // Same origin detection
+    assert_eq!(
+        extract_origin("https://example.com:443/foo"),
+        extract_origin("https://example.com/bar"),
+    );
+    // Different origins
+    assert_ne!(
+        extract_origin("https://example.com/page"),
+        extract_origin("https://other.example.com/page"),
+    );
+}
+
+#[test]
+fn strip_sensitive_headers_removes_auth_cookie_referer() {
+    use ::http::HeaderMap;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-custom", "keep".parse().unwrap());
+    headers.insert(::http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    headers.insert(::http::header::COOKIE, "session=abc".parse().unwrap());
+    headers.insert(::http::header::REFERER, "https://origin.com".parse().unwrap());
+    headers.insert(::http::header::ACCEPT, "text/html".parse().unwrap());
+
+    let safe = strip_sensitive_headers(&headers);
+
+    assert!(safe.get("x-custom").is_some());
+    assert!(safe.get(::http::header::ACCEPT).is_some());
+    assert!(safe.get(::http::header::AUTHORIZATION).is_none());
+    assert!(safe.get(::http::header::COOKIE).is_none());
+    assert!(safe.get(::http::header::REFERER).is_none());
+    assert_eq!(safe.len(), 2); // x-custom + accept
+}
+
+#[test]
+fn classify_response_body_returns_none_for_binary_data() {
+    assert!(classify_response_body(&[0u8; 100]).is_none());
+    assert!(classify_response_body(b"{\"key\": \"value\"}").is_none());
+}
+
+#[test]
+fn classify_response_body_returns_none_for_short_data() {
+    assert!(classify_response_body(b"<html>").is_none());
+}
+
+#[test]
+fn classify_response_body_detects_cloudflare_challenge() {
+    let body = b"<html><body>Checking your browser before accessing... <title>Attention Required! | Cloudflare</title></body></html>";
+    let result = classify_response_body(body);
+    assert!(matches!(result, Some(ChallengeKind::CloudflareChallenge)));
+}
+
+#[test]
+fn classify_response_body_detects_captcha() {
+    let body = b"<html><body><div class=\"g-recaptcha\">Please complete the CAPTCHA challenge</div></body></html>";
+    let result = classify_response_body(body);
+    assert!(matches!(result, Some(ChallengeKind::CaptchaChallenge)));
+}
+
+#[test]
+fn classify_response_body_returns_unexpected_html_for_unknown_html() {
+    let body = b"<html><body><h1>Welcome</h1><p>Some content here</p></body></html>";
+    let result = classify_response_body(body);
+    assert!(matches!(result, Some(ChallengeKind::UnexpectedHtml)));
+}
+
+#[test]
+fn cookie_jar_match_url_filters_by_domain_path_and_secure() {
+    let mut jar = crate::service::CookieJar::new();
+    jar.insert(crate::service::CookieEntry::new("session", "abc", "example.com"));
+    jar.insert(crate::service::CookieEntry::new("tracking", "xyz", "ads.com"));
+
+    let url = url::Url::parse("https://example.com/page").unwrap();
+    let matched = jar.match_url(&url);
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].name, "session");
+
+    let header_val = jar.header_value_for_url(&url);
+    assert_eq!(header_val, Some("session=abc".to_string()));
+
+    // Non-matching URL
+    let other_url = url::Url::parse("https://other.com/page").unwrap();
+    assert!(jar.match_url(&other_url).is_empty());
+}
+
+#[test]
+fn cookie_jar_header_value_for_url_returns_none_when_empty() {
+    let jar = crate::service::CookieJar::new();
+    let url = url::Url::parse("https://example.com").unwrap();
+    assert!(jar.header_value_for_url(&url).is_none());
+}
+
+#[test]
+fn challenge_requires_browser_session_returns_false_for_non_aborting_types() {
+    // UnexpectedHtml and AuthInterstitial do NOT trigger the abort path.
+    // Only known-challenge types (Cloudflare, CAPTCHA, BrowserCheck) abort.
+    assert!(!ChallengeKind::UnexpectedHtml.requires_browser_session());
+    assert!(!ChallengeKind::AuthInterstitial.requires_browser_session());
+
+    // Known challenge types DO abort.
+    assert!(ChallengeKind::CloudflareChallenge.requires_browser_session());
+    assert!(ChallengeKind::CaptchaChallenge.requires_browser_session());
+    assert!(ChallengeKind::BrowserCheck.requires_browser_session());
+}
+
+#[test]
+fn service_cookie_jar_merges_into_request_context_with_dedup() {
+    use crate::service::{CookieJar, CookieEntry, RequestContext};
+    use url::Url;
+
+    // Setup: service cookie jar with cookies for example.com
+    let mut jar = CookieJar::new();
+    jar.insert(CookieEntry::new("session", "abc", "example.com"));
+    jar.insert(CookieEntry::new("tracking", "xyz", "example.com"));
+
+    // Setup: per-request cookies (user-supplied)
+    let mut ctx = RequestContext::new();
+    ctx.cookies = Some(vec![
+        CookieEntry::new("session", "override", "example.com"), // same name/domain — should shadow jar
+        CookieEntry::new("custom", "val", "example.com"),
+    ]);
+
+    // Simulate the merge logic from TurService::add_download:
+    // match URL, collect jar cookies, dedup against existing per-request cookies
+    let url = Url::parse("https://example.com/page").unwrap();
+    let jar_cookies: Vec<CookieEntry> = jar.match_url(&url).into_iter().cloned().collect();
+
+    let mut existing = ctx.cookies.take().unwrap_or_default();
+    for c in jar_cookies {
+        if !existing.iter().any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path) {
+            existing.push(c);
+        }
+    }
+    ctx.cookies = Some(existing);
+
+    // Verify: 3 cookies total (custom, session(override), tracking)
+    let cookies = ctx.cookies.as_ref().unwrap();
+    assert_eq!(cookies.len(), 3, "should have custom + session(override) + tracking");
+
+    // Verify per-request "session" override was NOT shadowed by jar's "session"
+    let session = cookies.iter().find(|c| c.name == "session").unwrap();
+    assert_eq!(
+        session.value, "override",
+        "per-request session cookie should take priority over jar session cookie"
+    );
+
+    // Verify tracking cookie from jar was merged in
+    assert!(cookies.iter().any(|c| c.name == "tracking"), "jar tracking cookie should be present");
+
+    // Verify custom cookie from per-request context is preserved
+    assert!(cookies.iter().any(|c| c.name == "custom"), "per-request custom cookie should be present");
 }

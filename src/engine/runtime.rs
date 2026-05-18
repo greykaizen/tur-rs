@@ -10,6 +10,9 @@ pub(super) struct RuntimeControl {
     pub(super) halt_mode: Cell<HaltMode>,
     pub(super) cancel_flag: Cell<bool>,
     pub(super) scaler_config: Rc<RefCell<ScalerConfig>>,
+    /// Set by a worker when a challenge/interstitial page is detected.
+    /// The download will be aborted with this reason.
+    pub(super) challenge_reason: RefCell<Option<String>>,
 }
 
 impl RuntimeControl {
@@ -18,6 +21,7 @@ impl RuntimeControl {
             halt_mode: Cell::new(HaltMode::Running),
             cancel_flag: Cell::new(false),
             scaler_config: Rc::new(RefCell::new(scaler_config)),
+            challenge_reason: RefCell::new(None),
         }
     }
 

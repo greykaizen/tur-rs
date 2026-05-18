@@ -32,6 +32,8 @@ pub(super) struct ConnectionWorker {
     pub(super) scaler: Rc<Scaler>,
     pub(super) storage_config: storage::StorageConfig,
     pub(super) h3_client: Option<Rc<RefCell<crate::quic::H3Client>>>,
+    /// Custom request headers from DownloadTask request_context.
+    pub(super) request_headers: Option<::http::HeaderMap>,
 }
 
 #[derive(Debug, Default)]
@@ -465,6 +467,7 @@ impl ConnectionWorker {
                 Method::GET,
                 &self.url,
                 Some((start, end - 1)),
+                self.request_headers.as_ref(),
             )
             .await
             {
@@ -525,6 +528,31 @@ impl ConnectionWorker {
                 .borrow_mut()
                 .note_range_support(&self.origin, supports_ranges);
 
+            // Pre-checks for challenge/interstitial detection:
+            // Only classify the body as a potential challenge if the response
+            // is NOT a range response (206), the content type looks like HTML,
+            // and there's no Content-Disposition suggesting a file download.
+            let is_partial_content = response.status() == ::http::StatusCode::PARTIAL_CONTENT;
+            let response_content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let has_attachment_disposition = response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .map_or(false, |cd| {
+                    cd.to_ascii_lowercase().contains("attachment")
+                        || cd.to_ascii_lowercase().contains("filename=")
+                });
+            let should_check_challenge = !is_partial_content
+                && !has_attachment_disposition
+                && (response_content_type.is_empty()
+                    || response_content_type.contains("text/html")
+                    || response_content_type.contains("application/xhtml")
+                    || response_content_type.contains("text/plain"));
+
             // Phase 3c: Inspect Alt-Svc header for H3 upgrade hint
             if let Some(h3_port) = crate::quic::parse_alt_svc_h3_port(response.headers()) {
                 self.origin_memory
@@ -563,6 +591,44 @@ impl ConnectionWorker {
 
                 while !self.bucket.consume(chunk.len()) {
                     tokio::task::yield_now().await;
+                }
+
+                // Challenge/interstitial detection on first response chunk.
+                // Only run if the response headers suggested this could be a challenge page.
+                if first_chunk_at.is_none() && should_check_challenge {
+                    if let Some(challenge) = classify_response_body(&chunk) {
+                        let challenge_str = challenge.as_str();
+                        self.origin_memory
+                            .borrow_mut()
+                            .note_challenge_detected(&self.origin, Some(challenge));
+
+                        if challenge.requires_browser_session() {
+                            // Known challenge types that definitely aren't the real file.
+                            // Abort the download.
+                            self.log_msg(&format!(
+                                "challenge_detected origin={} kind={} aborting_download",
+                                self.origin, challenge_str
+                            ))
+                            .await;
+                            *self.control.challenge_reason.borrow_mut() = Some(
+                                format!(
+                                    "download aborted: server returned challenge/interstitial page ({})",
+                                    challenge_str
+                                ),
+                            );
+                            self.control.request_pause();
+                            break;
+                        } else {
+                            // UnexpectedHtml or AuthInterstitial — could be a legitimate
+                            // HTML file download, or a login wall the user needs to handle.
+                            // Log a warning but do NOT abort the download.
+                            self.log_msg(&format!(
+                                "html_response_detected origin={} kind={} continuing_download",
+                                self.origin, challenge_str
+                            ))
+                            .await;
+                        }
+                    }
                 }
 
                 if first_chunk_at.is_none() {

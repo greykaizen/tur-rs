@@ -17,6 +17,7 @@ use tur_rs::engine::{
     DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode,
     ScheduleMode,
 };
+use tur_rs::service::RequestContext;
 use tur_rs::storage::StorageConfig;
 
 #[cfg(feature = "tui")]
@@ -62,6 +63,94 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 }
 
+fn build_request_context(cli: &Cli) -> Option<RequestContext> {
+    let mut ctx = RequestContext::new();
+
+    // Parse --header flags
+    for h in &cli.header {
+        if let Some(eq_pos) = h.find(':') {
+            let name = h[..eq_pos].trim().to_string();
+            let value = h[eq_pos + 1..].trim().to_string();
+            if !name.is_empty() {
+                ctx = ctx.header(name, value);
+            }
+        } else {
+            eprintln!("WARNING: ignoring malformed --header value (expected \"Name: value\"): {}", h);
+        }
+    }
+
+    // --referer
+    if let Some(ref referer) = cli.referer {
+        ctx = ctx.referer(referer.clone());
+    }
+
+    // --auth-bearer
+    if let Some(ref token) = cli.auth_bearer {
+        ctx = ctx.auth(format!("Bearer {}", token));
+    }
+
+    // Return None if nothing was set
+    if ctx.headers.is_empty() && ctx.auth.is_none() && ctx.referer.is_none() {
+        return None;
+    }
+    Some(ctx)
+}
+
+async fn import_cookie_file(ctx: &mut Option<RequestContext>, path: &Option<String>, urls: &[String]) {
+    let Some(path_str) = path else { return };
+    let path = PathBuf::from(path_str);
+    let contents = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("WARNING: failed to read cookie file {}: {}", path.display(), e);
+            return;
+        }
+    };
+
+    let mut cookie_vec = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 7 {
+            let domain = parts[0].trim_start_matches('.');
+            let path = parts[2];
+            let secure = parts[3] == "TRUE";
+            let name = parts[5];
+            let value = parts[6];
+            cookie_vec.push(tur_rs::CookieEntry {
+                name: name.to_string(),
+                value: value.to_string(),
+                domain: domain.to_string(),
+                path: path.to_string(),
+                secure,
+                expires: None,
+            });
+        } else if let Some(eq_pos) = line.find('=') {
+            let name = line[..eq_pos].trim();
+            let value = line[eq_pos + 1..].trim();
+            if !name.is_empty() {
+                // Derive domain from the first download URL so the cookie has
+                // meaningful domain context for origin-memory persistence.
+                let domain = urls.first()
+                    .and_then(|u| url::Url::parse(u).ok())
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_default();
+                cookie_vec.push(tur_rs::CookieEntry::new(name, value, &domain));
+            }
+        }
+    }
+
+    if !cookie_vec.is_empty() {
+        let count = cookie_vec.len();
+        let ctx_ref = ctx.get_or_insert_with(RequestContext::new);
+        ctx_ref.cookies = Some(cookie_vec);
+        eprintln!("INFO: imported {} cookie(s) from {}", count, path.display());
+    }
+}
+
 #[cfg(feature = "tui")]
 async fn run_tui(cli: Cli) -> Result<()> {
     let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
@@ -96,6 +185,9 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
+    let mut request_context = build_request_context(&cli);
+    import_cookie_file(&mut request_context, &cli.cookie_file, &cli.url).await;
+
     let mut app = TuiApp::new(
         engine_tx.clone(),
         connections,
@@ -108,6 +200,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         schedule_mode,
         http_mode,
         cli.log_root.clone().map(PathBuf::from),
+        request_context,
     );
 
     for url in cli.url {
@@ -155,6 +248,9 @@ async fn run_headless(cli: Cli) -> Result<()> {
         }
     });
 
+    let mut request_context = build_request_context(&cli);
+    import_cookie_file(&mut request_context, &cli.cookie_file, &cli.url).await;
+
     let dir = PathBuf::from(&cli.dir);
     let log_root = cli.log_root.clone().map(PathBuf::from);
     let tasks: Vec<DownloadTask> = cli
@@ -179,6 +275,7 @@ async fn run_headless(cli: Cli) -> Result<()> {
             schedule_mode,
             http_mode,
             log_root: log_root.clone(),
+            request_context: request_context.clone(),
         })
         .collect();
 

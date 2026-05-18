@@ -48,6 +48,11 @@ struct PersistedOriginProfile {
     supports_ranges: Option<bool>,
     content_length_reliable: Option<bool>,
     saw_rate_limit: bool,
+    cookies_used: Option<bool>,
+    auth_used: Option<bool>,
+    referer_used: Option<bool>,
+    challenge_detected: Option<bool>,
+    challenge_kind: Option<String>,
     last_used_tick: u64,
 }
 
@@ -123,6 +128,11 @@ impl OriginMemoryStore {
             supports_ranges: None,
             content_length_reliable: None,
             saw_rate_limit: false,
+            cookies_used: None,
+            auth_used: None,
+            referer_used: None,
+            challenge_detected: None,
+            challenge_kind: None,
             last_used_tick: tick,
         });
         profile.last_used_tick = tick;
@@ -201,6 +211,54 @@ impl OriginMemoryStore {
         self.persist();
     }
 
+    pub(super) fn note_session_requirement(
+        &mut self,
+        origin: &str,
+        field: SessionRequirementField,
+        used: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let profile = self.touch_profile(origin);
+        match field {
+            SessionRequirementField::Cookies => profile.cookies_used = Some(used),
+            SessionRequirementField::Auth => profile.auth_used = Some(used),
+            SessionRequirementField::Referer => profile.referer_used = Some(used),
+        }
+        self.prune_lru();
+        self.persist();
+    }
+
+    pub(super) fn note_challenge_detected(
+        &mut self,
+        origin: &str,
+        kind: Option<super::ChallengeKind>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let profile = self.touch_profile(origin);
+        profile.challenge_detected = Some(kind.is_some());
+        profile.challenge_kind = kind.map(|k| k.as_str().to_string());
+        self.prune_lru();
+        self.persist();
+    }
+
+    pub(super) fn session_info_for_origin(&self, origin: &str) -> Option<SessionMemoryInfo> {
+        if !self.enabled {
+            return None;
+        }
+        self.entries.get(origin).map(|p| SessionMemoryInfo {
+            cookies_used: p.cookies_used,
+            auth_used: p.auth_used,
+            referer_used: p.referer_used,
+            challenge_detected: p.challenge_detected,
+            challenge_kind: p.challenge_kind.clone(),
+            saw_rate_limit: p.saw_rate_limit,
+        })
+    }
+
     fn prune_lru(&mut self) {
         while self.entries.len() > ORIGIN_MEMORY_CAPACITY {
             let Some(lru_key) = self
@@ -247,6 +305,23 @@ impl OriginMemoryStore {
     pub(super) fn memory_hit_for_origin(&self, origin: &str) -> bool {
         self.enabled && self.entries.contains_key(origin)
     }
+}
+
+/// A field of session requirement that can be remembered per-origin.
+pub(super) enum SessionRequirementField {
+    Cookies,
+    Auth,
+    Referer,
+}
+
+/// Summary of session memory for a single origin.
+pub(super) struct SessionMemoryInfo {
+    pub cookies_used: Option<bool>,
+    pub auth_used: Option<bool>,
+    pub referer_used: Option<bool>,
+    pub challenge_detected: Option<bool>,
+    pub challenge_kind: Option<String>,
+    pub saw_rate_limit: bool,
 }
 
 impl OriginH2TuningStore {

@@ -103,8 +103,15 @@ pub(super) async fn send_request_follow_redirects(
     method: Method,
     url: &str,
     range: Option<(u64, u64)>,
+    extra_headers: Option<&::http::HeaderMap>,
 ) -> Result<hyper::Response<Incoming>> {
     let mut current_url = url.to_owned();
+    let original_origin = extract_origin(url);
+
+    // Clone headers to owned so we can create a safe variant for cross-origin redirects
+    let owned_headers = extra_headers.cloned();
+    let safe_headers = owned_headers.as_ref().map(|h| strip_sensitive_headers(h));
+    let mut crossed_origin = false;
 
     for _ in 0..=MAX_REDIRECTS {
         let uri: Uri = current_url.parse()?;
@@ -116,6 +123,13 @@ pub(super) async fn send_request_follow_redirects(
         if let Some((start, end)) = range {
             builder = builder.header(RANGE, format!("bytes={}-{}", start, end));
         }
+        // Apply session/context headers (auth, referer, cookies, custom)
+        let headers_to_use = if crossed_origin { &safe_headers } else { &owned_headers };
+        if let Some(headers) = headers_to_use {
+            for (name, value) in headers.iter() {
+                builder = builder.header(name, value);
+            }
+        }
         let request = builder.body(Empty::<Bytes>::new())?;
         let response: hyper::Response<Incoming> = client.request(request).await?;
 
@@ -125,7 +139,17 @@ pub(super) async fn send_request_follow_redirects(
                 .get(LOCATION)
                 .and_then(|value: &::http::HeaderValue| value.to_str().ok())
                 .ok_or_else(|| anyhow!("redirect missing location header"))?;
-            current_url = resolve_redirect_url(&current_url, location)?;
+            let new_url = resolve_redirect_url(&current_url, location)?;
+
+            // Check if this redirect crosses origins
+            if !crossed_origin {
+                let new_origin = extract_origin(&new_url);
+                if new_origin != original_origin {
+                    crossed_origin = true;
+                }
+            }
+
+            current_url = new_url;
             continue;
         }
 
@@ -133,6 +157,45 @@ pub(super) async fn send_request_follow_redirects(
     }
 
     Err(anyhow!("too many redirects for {}", url))
+}
+
+/// Extract the origin (scheme + host + port) from a URL string.
+pub(super) fn extract_origin(url_str: &str) -> String {
+    if let Ok(parsed) = Url::parse(url_str) {
+        let default_port = match parsed.scheme() {
+            "https" => "443",
+            "http" => "80",
+            _ => "",
+        };
+        let port = parsed
+            .port()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| default_port.to_string());
+        format!(
+            "{}://{}:{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or(""),
+            port
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Strip sensitive headers (Authorization, Cookie, Referer) for cross-origin safety.
+pub(super) fn strip_sensitive_headers(headers: &::http::HeaderMap) -> ::http::HeaderMap {
+    let mut safe = ::http::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        // Skip headers that should not be forwarded on cross-origin requests
+        if name == ::http::header::AUTHORIZATION
+            || name == ::http::header::COOKIE
+            || name == ::http::header::REFERER
+        {
+            continue;
+        }
+        safe.insert(name.clone(), value.clone());
+    }
+    safe
 }
 
 pub(super) fn resolve_redirect_url(base: &str, location: &str) -> Result<String> {

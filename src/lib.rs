@@ -86,7 +86,10 @@ pub mod tui;
 // internal and subject to change.
 // ---------------------------------------------------------------------------
 
-pub use service::{DownloadHandle, DownloadRequest, DownloadUpdate, ServiceConfig, TurService};
+pub use service::{
+    CookieEntry, CookieJar, DownloadHandle, DownloadRequest, DownloadUpdate, RequestContext,
+    ServiceConfig, SessionContext, TurService,
+};
 pub use storage::StorageConfig;
 
 pub use engine::{DownloadStatus, HttpMode, ScheduleMode};

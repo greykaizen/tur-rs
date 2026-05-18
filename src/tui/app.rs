@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::engine::{
     DownloadTask, DownloadStatus, EngineEvent, EngineCommand, HttpMode, ScheduleMode,
 };
+use crate::service::RequestContext;
 
 use super::input::InputMode;
 
@@ -39,6 +40,7 @@ pub struct TuiApp {
     schedule_mode: ScheduleMode,
     http_mode: HttpMode,
     log_root: Option<PathBuf>,
+    request_context: Option<RequestContext>,
 }
 
 impl TuiApp {
@@ -54,6 +56,7 @@ impl TuiApp {
         schedule_mode: ScheduleMode,
         http_mode: HttpMode,
         log_root: Option<PathBuf>,
+        request_context: Option<RequestContext>,
     ) -> Self {
         Self {
             tasks: Vec::new(),
@@ -72,6 +75,7 @@ impl TuiApp {
             schedule_mode,
             http_mode,
             log_root,
+            request_context,
         }
     }
 
@@ -96,6 +100,7 @@ impl TuiApp {
             schedule_mode: self.schedule_mode,
             http_mode: self.http_mode,
             log_root: self.log_root.clone(),
+            request_context: self.request_context.clone(),
         };
         self.tasks.push(task.clone());
         let _ = self.engine_tx.try_send(EngineCommand::Add(task));

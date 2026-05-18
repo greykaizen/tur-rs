@@ -30,6 +30,9 @@ pub struct DownloadTask {
     pub schedule_mode: ScheduleMode,
     pub http_mode: HttpMode,
     pub log_root: Option<PathBuf>,
+    /// Session context for authenticated/session-aware downloading.
+    #[serde(skip)]
+    pub request_context: Option<crate::service::RequestContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
