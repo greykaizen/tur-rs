@@ -1,11 +1,9 @@
-pub mod cli;
-pub mod connector;
-pub mod engine;
-pub mod quic;
-pub mod storage;
-pub mod tui;
+//! tur-rs binary entry point.
+//!
+//! This is deliberately thin — all real logic lives in the library crate
+//! (`src/lib.rs`). The binary only handles CLI parsing, runtime setup, and
+//! dispatching to the headless or TUI frontend.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -14,10 +12,15 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use uuid::Uuid;
 
-use cli::Cli;
-use engine::{DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ScheduleMode};
-use storage::StorageConfig;
-use tui::TuiApp;
+use tur_rs::cli::Cli;
+use tur_rs::engine::{
+    DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode,
+    ScheduleMode,
+};
+use tur_rs::storage::StorageConfig;
+
+#[cfg(feature = "tui")]
+use tur_rs::tui::TuiApp;
 
 fn main() -> Result<()> {
     // Install the ring-based CryptoProvider for rustls before any TLS code runs.
@@ -47,9 +50,22 @@ async fn async_main(cli: Cli) -> Result<()> {
         return run_headless(cli).await;
     }
 
+    #[cfg(feature = "tui")]
+    {
+        return run_tui(cli).await;
+    }
+
+    #[cfg(not(feature = "tui"))]
+    {
+        eprintln!("TUI mode requires the 'tui' feature. Falling back to headless mode.");
+        run_headless(cli).await
+    }
+}
+
+#[cfg(feature = "tui")]
+async fn run_tui(cli: Cli) -> Result<()> {
     let schedule_mode = ScheduleMode::parse(&cli.schedule_mode)?;
     let http_mode = HttpMode::parse(&cli.http_mode)?;
-
     let (connections, min_connections, max_connections) = resolve_connection_settings(&cli)?;
     let tasks_limit = cli.tasks;
     let max_total_connections = cli.max_total_connections.max(1);
@@ -166,13 +182,13 @@ async fn run_headless(cli: Cli) -> Result<()> {
         })
         .collect();
 
-    let task_ids: HashSet<Uuid> = tasks.iter().map(|task| task.id).collect();
+    let task_ids: std::collections::HashSet<Uuid> = tasks.iter().map(|task| task.id).collect();
 
     for task in tasks {
         let _ = engine_tx.send(EngineCommand::Add(task)).await;
     }
 
-    let mut finished = HashSet::new();
+    let mut finished = std::collections::HashSet::new();
     let mut saw_error = false;
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -214,7 +230,7 @@ fn mbps_to_bps(mbps: u64) -> u64 {
     mbps.saturating_mul(1_000_000) / 8
 }
 
-fn resolve_connection_settings(cli: &Cli) -> Result<(usize, usize, usize)> {
+fn resolve_connection_settings(cli: &tur_rs::cli::Cli) -> Result<(usize, usize, usize)> {
     let default_initial = 8usize;
     let default_min = 1usize;
     let default_max = 16usize;

@@ -1,99 +1,158 @@
 <div align="center">
   <img src="docs/images/tur.png" alt="Tur Logo" width="80" />
   <h1>Tur</h1>
-  <p><strong>A hyper-fast, highly concurrent download manager built in Rust.</strong></p>
+  <p><strong>tur-rs</strong> — A hyper-fast, highly concurrent download manager for Rust.</p>
 </div>
 
 ---
 
-## 🎯 Purpose & Inspiration
+**tur-rs** is a reusable download core that can be embedded as a Rust library or
+used via its CLI/TUI binary. It uses adaptive work-stealing, protocol-aware
+scheduling, and platform-optimised storage backends to saturate your bandwidth
+with a minimal memory footprint (~15 MB).
 
-**Tur** is heavily inspired by `aria2c`, an incredible and robust tool that has served the community for years as the gold standard for high-speed downloads. We built Tur to explore how those proven concurrent downloading concepts could be implemented using the modern Rust asynchronous ecosystem (`tokio` and `hyper`).
+## Features
 
-By leveraging Rust, Tur achieves:
-- **A Lean Footprint:** Utilizing Rust's zero-cost abstractions to maintain a minuscule memory footprint (routinely <15MB).
-- **Relentless Saturation:** An aggressive "range borrowing" scheduler ensures that if one TCP connection finishes its chunk early, it instantly steals work from slower connections, maximizing throughput.
-- **Adaptive Storage:** A custom-built storage engine that uses aligned memory and positional writes for maximum I/O efficiency across Linux, macOS, and Windows.
+| Layer | Capability |
+|-------|------------|
+| **Protocol** | HTTP/1.1, HTTP/2, HTTP/3 (experimental) with auto-negotiation |
+| **Scheduling** | Dynamic range stealing with Fibonacci, equal, or adaptive chunking |
+| **Storage** | Aligned I/O, splice (Linux), direct I/O, Windows overlapped |
+| **Scaling** | Adaptive connection management from real-time throughput signals |
+| **CLI** | Full terminal UI (ratatui) or headless mode for scripting |
+| **Library** | Embeddable via `TurService` facade — see `examples/embed.rs` |
 
-## ✨ Features
+## Library embedding
 
-- **Concurrent Chunking:** Splits single files into dynamic byte ranges to bypass per-connection speed limits.
-- **Advanced Schedulers:** Supports `equal`, `fib`, and the experimental `fib-adaptive` mode for dynamic work stealing.
-- **Adaptive Storage Engine:** Uses **Aligned I/O** and **Positional Writes** to minimize syscall overhead and memory thrashing.
-- **Dynamic Write Buffering:** Smart worker buffers that scale from 64KB up to 1MB based on real-time connection throughput.
-- **Protocol Flexibility:** Native HTTP/1.1 and HTTP/2 support with auto-negotiation.
-- **Beautiful TUI:** A responsive, real-time terminal user interface powered by `ratatui` (headless mode also available).
+Add `tur-rs` to your `Cargo.toml`:
 
-## 📈 Benchmark Comparison
-
-Tur is designed to be the efficiency leader among high-speed downloaders. In our testing, Tur matches the performance of established C/C++ tools while maintaining a **massively lower memory footprint.**
-
-### Methodology & Results
-The following data represents a snapshot from a **"Full Tournament"** benchmark run.
-
-**Environment:**
-- **Date:** 2026-05-09
-- **OS:** Linux (x86_64)
-- **Network:** Real-world WAN (~2.5 MiB/s per connection)
-- **Artifacts:** VSCode / VLC Large Binaries.
-- **Configuration:** 4-8 connections, `fib-adaptive` mode, `http1`.
-
-<div align="center">
-  <img src="docs/images/benchmark_speed.png" alt="Download Time Performance" width="600" />
-  <p><em>Tur is competitively aligned with Axel and aria2c, maintaining parity with the fastest tools in its class.</em></p>
-</div>
-
-<div align="center">
-  <img src="docs/images/benchmark_memory.png" alt="Memory Efficiency" width="600" />
-  <p><em>Tur sets a new standard for efficiency, using ~55% less memory than aria2c and remaining ~28% leaner than Axel.</em></p>
-</div>
-
-**Technical Edge:**
-- **Aligned Storage:** We use page-aligned memory buffers to prepare for Zero-Copy I/O and Direct disk access.
-- **Speed-Aware Stealing:** The scheduler dynamically monitors connection health and reallocates ranges from "stragglers" to faster workers.
-- **Zero-Copy Architecture:** Designed to minimize the path between the network card and the physical storage.
-
-## 🚀 Installation
-
-Ensure you have [Rust and Cargo](https://rustup.rs/) installed, then clone the repository and build:
-
-```bash
-cargo build --release
+```toml
+[dependencies]
+tur-rs = { git = "https://github.com/greykaizen/tur-rs" }
 ```
 
-The optimized executable will be located at `target/release/tur`.
+Then use the `TurService` facade:
 
-## 🛠️ Usage
+```rust
+use tokio::task::LocalSet;
+use tur_rs::{TurService, ServiceConfig, DownloadRequest, DownloadUpdate};
 
-```bash
-tur [OPTIONS] --url <URL>...
+let local = LocalSet::new();
+local.run_until(async {
+    let mut service = TurService::new(ServiceConfig::default()).await?;
+    let mut handle = service
+        .add_download(DownloadRequest::new("https://example.com/file.zip"))
+        .await?;
+
+    while let Some(update) = handle.recv().await {
+        match update {
+            DownloadUpdate::Progress { downloaded_bytes, speed_bps } =>
+                println!("{downloaded_bytes} bytes at {speed_bps:.0} bps"),
+            DownloadUpdate::StatusChanged(status) => {
+                if matches!(status, tur_rs::DownloadStatus::Completed) { break; }
+            }
+            _ => {}
+        }
+    }
+    service.shutdown().await;
+    Ok::<_, anyhow::Error>(())
+}).await;
 ```
 
-### Core Options
+See [`examples/embed.rs`](examples/embed.rs) for a complete runnable example.
 
-- `-u, --url <URL>...`: Target URL(s) to download.
-- `-d, --dir <DIR>`: Output directory (default: `.`).
-- `-c, --connections <CONNECTIONS>`: Number of concurrent TCP connections per file (default: `8`).
-- `-t, --tasks <TASKS>`: Number of files to download simultaneously (default: `3`).
-- `--headless`: Run in the background without the graphical TUI.
+## CLI usage
 
-### Advanced Tuning
+```bash
+# Install the binary
+cargo install --path .
 
-- `--schedule-mode <MODE>`: Range chunking algorithm (`equal` or `fib`).
-- `--http-mode <MODE>`: Force HTTP transport mode (`auto`, `http1`, or `http2`).
-- `--borrow-limit-mb <MB>`: The minimum megabytes left in a chunk before another worker is allowed to steal from it (default: `2`).
-- `--threads <THREADS>`: Max OS threads for the asynchronous runtime pool.
-- `--dry-run`: Run the entire network handshake and scheduling loop without saving data.
+# Download a file
+tur --url https://example.com/file.zip
 
-## 🤝 Contribution
+# With 16 connections, 2 concurrent tasks, in the background
+tur -u https://example.com/file.zip -c 16 -t 2 --headless
+```
 
-Contributions are more than welcome! Whether it's optimizing the `hyper` pipeline, adding new TUI widgets, or fixing bugs:
-1. Fork the repository.
-2. Create a feature branch (`git checkout -b feature/blazing-fast-io`).
-3. Commit your changes (`git commit -m 'Add blazing fast IO'`).
-4. Push to the branch (`git push origin feature/blazing-fast-io`).
-5. Open a Pull Request.
+### Core options
 
-## 📄 License
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-u, --url <URL>` | Target URL(s) to download | required |
+| `-d, --dir <DIR>` | Output directory | `.` |
+| `-c, --connections <N>` | Connections per download | `8` |
+| `-t, --tasks <N>` | Concurrent downloads | `3` |
+| `--headless` | Run without TUI | `false` |
+| `--http-mode <MODE>` | Force HTTP mode (`auto`, `http1`, `http2`, `http3`) | `auto` |
+| `--schedule-mode <MODE>` | Chunking algorithm (`equal`, `fib`) | `fib` |
 
-This project is open-source and available under the [GNU General Public License v3.0](LICENSE).
+Run `tur --help` for the full list.
+
+## Feature flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `tui` | ✓ | Terminal UI (ratatui, crossterm) |
+| `http3` | | Experimental HTTP/3 via QUIC |
+| `linux-io-uring-experimental` | | Linux io_uring storage |
+
+## Benchmarks
+
+Tur matches the speed of established tools while using significantly less memory.
+
+<div align="center">
+  <img src="docs/images/benchmark_speed.png" alt="Download speed benchmark" width="500" />
+  <img src="docs/images/benchmark_memory.png" alt="Memory benchmark" width="500" />
+</div>
+
+<table>
+<tr><th>Metric</th><th>Tur</th><th>aria2c</th><th>Axel</th></tr>
+<tr><td>Peak memory</td><td><strong>~10 MB</strong></td><td>~22 MB</td><td>~14 MB</td></tr>
+<tr><td>Download time</td><td colspan="3" align="center"><em>parity across real-world WAN tests</em></td></tr>
+</table>
+
+[Full benchmark methodology](docs/benchmarks.md)
+
+## Project structure
+
+```
+src/
+├── lib.rs           # Library crate root (stable API re-exports)
+├── main.rs          # Thin binary bootstrap
+├── cli.rs           # CLI argument parsing (clap)
+├── connector.rs     # Platform-adaptive TCP connector
+├── engine.rs        # Core engine: scheduling, scaling, lifecycle
+├── engine/          # Engine sub-modules
+│   ├── coordinator/ # Range coordination & state tracking
+│   ├── http/        # HTTP client construction & protocol helpers
+│   ├── metrics/     # Scheduler metrics counters
+│   ├── runtime/     # DownloadEngine runtime & event dispatch
+│   ├── scaler/      # Adaptive connection scaler
+│   ├── types/       # Shared type definitions
+│   ├── worker/      # Per-connection worker logic
+│   ├── helpers.rs   # Statistical & helper functions
+│   ├── origin_memory.rs
+│   ├── persistence.rs
+│   └── ranges.rs
+├── quic.rs          # HTTP/3 client (feature-gated)
+├── service.rs       # TurService facade for library embedding
+├── storage.rs       # Platform storage backends
+└── tui/             # Terminal UI (feature-gated)
+    ├── app.rs
+    ├── input.rs
+    └── render.rs
+```
+
+## Stability
+
+The types re-exported from the crate root (`TurService`, `ServiceConfig`,
+`DownloadRequest`, `DownloadHandle`, `DownloadUpdate`, `DownloadStatus`,
+`HttpMode`, `ScheduleMode`, `StorageConfig`) form the **stable public API**
+and follow semantic versioning.
+
+Internal modules (`engine`, `connector`, `quic`, `storage`, `cli`, `tui`) are
+exposed for advanced use but may change between minor releases.
+
+## License
+
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
