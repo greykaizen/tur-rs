@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod connector;
 pub mod engine;
+pub mod quic;
 pub mod storage;
 pub mod tui;
 
@@ -19,6 +20,14 @@ use storage::StorageConfig;
 use tui::TuiApp;
 
 fn main() -> Result<()> {
+    // Install the ring-based CryptoProvider for rustls before any TLS code runs.
+    // Required when the http3 feature is enabled because rustls 0.23 ships with
+    // both aws-lc-rs and ring, and cannot auto-determine which to use.
+    #[cfg(feature = "http3")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let cli = Cli::parse();
     let runtime = if cli.runtime_threads <= 1 {
         tokio::runtime::Builder::new_current_thread()
@@ -54,7 +63,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     let engine_cmd_tx = engine_tx.clone();
     let storage_config = StorageConfig {
         use_pwrite: !cli.no_pwrite,
+        use_splice: !cli.no_splice,
         no_io_uring: cli.no_io_uring,
+        no_direct_io: cli.no_direct_io,
     };
     let engine = DownloadEngine::new(
         connections,
@@ -111,7 +122,9 @@ async fn run_headless(cli: Cli) -> Result<()> {
     let engine_cmd_tx = engine_tx.clone();
     let storage_config = StorageConfig {
         use_pwrite: !cli.no_pwrite,
+        use_splice: !cli.no_splice,
         no_io_uring: cli.no_io_uring,
+        no_direct_io: cli.no_direct_io,
     };
     let engine = DownloadEngine::new(
         connections,

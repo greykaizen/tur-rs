@@ -75,9 +75,17 @@ pub struct Cli {
     #[arg(long = "no-pwrite", alias = "no-splice", default_value_t = false)]
     pub no_pwrite: bool,
 
+    /// Disable Linux kernel splice() zero-copy write path (pipe+splice)
+    #[arg(long, default_value_t = false)]
+    pub no_splice: bool,
+
     /// Disable Linux io_uring write path (experimental)
     #[arg(long, default_value_t = false)]
     pub no_io_uring: bool,
+
+    /// Disable Direct I/O (FILE_FLAG_NO_BUFFERING) on Windows; has no effect on other platforms
+    #[arg(long, default_value_t = false)]
+    pub no_direct_io: bool,
 
     /// Number of worker threads for the async runtime; 1 = single-threaded
     #[arg(long, default_value_t = 1)]

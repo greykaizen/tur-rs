@@ -122,6 +122,7 @@ pub enum HttpMode {
     Auto,
     Http1,
     Http2,
+    Http3,
 }
 
 impl HttpMode {
@@ -130,6 +131,7 @@ impl HttpMode {
             "auto" => Ok(Self::Auto),
             "http1" | "http/1.1" | "h1" => Ok(Self::Http1),
             "http2" | "http/2" | "h2" => Ok(Self::Http2),
+            "http3" | "http/3" | "h3" | "quic" => Ok(Self::Http3),
             other => Err(anyhow!("unsupported http mode: {}", other)),
         }
     }
@@ -139,6 +141,7 @@ impl HttpMode {
             Self::Auto => "auto",
             Self::Http1 => "http1",
             Self::Http2 => "http2",
+            Self::Http3 => "http3",
         }
     }
 }
@@ -247,6 +250,7 @@ struct SchedulerMetrics {
     http_requests: Cell<u64>,
     http1_requests: Cell<u64>,
     http2_requests: Cell<u64>,
+    http3_requests: Cell<u64>,
     http_other_requests: Cell<u64>,
     http_setup_ms: Cell<u64>,
     http_ttfb_ms: Cell<u64>,
@@ -276,6 +280,11 @@ struct SchedulerMetrics {
     http1_scale_drops: Cell<u64>,
     http2_scale_adds: Cell<u64>,
     http2_scale_drops: Cell<u64>,
+    http2_stream_adds: Cell<u64>,
+    http3_scale_adds: Cell<u64>,
+    http3_scale_drops: Cell<u64>,
+    http2_conn_adds: Cell<u64>,
+    h2_stream_saturated_count: Cell<u64>,
     adaptive_min_steal_bytes_final: Cell<u64>,
     adaptive_heartbeat_ms_final: Cell<u64>,
     adaptive_refill_interval_ms_final: Cell<u64>,
@@ -287,7 +296,7 @@ struct SchedulerMetrics {
 impl SchedulerMetrics {
     fn summary_line(&self) -> String {
         format!(
-            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} max_active_connections_observed={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_prefetch_trigger_bytes={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
+            "metrics direct_assignments={} borrow_assignments={} bytes_borrowed={} straggler_splits={} tail_splits={} work_requests={} request_wait_ms={} prefetch_requests={} prefetch_ready={} prefetch_hits={} http_requests={} http1_requests={} http2_requests={} http_other_requests={} http_setup_ms={} http_ttfb_ms={} http_stream_ms={} file_write_ms={} completed_ranges={} retry_attempts={} retry_wait_ms={} startup_workers={} startup_open_file_ms={} startup_first_assignment_wait_ms={} startup_first_request_setup_ms={} startup_first_byte_ms={} startup_total_to_first_byte_ms={} max_active_connections_observed={} reused_requests={} fresh_requests={} http1_reused_requests={} http1_fresh_requests={} http2_reused_requests={} http2_fresh_requests={} fresh_handshake_ms={} http1_fresh_handshake_ms={} http2_fresh_handshake_ms={} skipped_growth_samples={} http1_scale_adds={} http1_scale_drops={} http2_scale_adds={} http2_scale_drops={} http2_stream_adds={} http2_conn_adds={} h2_stream_saturated_count={} adaptive_min_steal_bytes_final={} adaptive_heartbeat_ms_final={} adaptive_refill_interval_ms_final={} max_prefetch_trigger_bytes={} max_write_buffer_target_bytes={} max_ewma_write_latency_ms={:.1}",
             self.direct_assignments.get(),
             self.borrow_assignments.get(),
             self.bytes_borrowed.get(),
@@ -330,6 +339,9 @@ impl SchedulerMetrics {
             self.http1_scale_drops.get(),
             self.http2_scale_adds.get(),
             self.http2_scale_drops.get(),
+            self.http2_stream_adds.get(),
+            self.http2_conn_adds.get(),
+            self.h2_stream_saturated_count.get(),
             self.adaptive_min_steal_bytes_final.get(),
             self.adaptive_heartbeat_ms_final.get(),
             self.adaptive_refill_interval_ms_final.get(),
@@ -415,6 +427,7 @@ pub enum ScalerAction {
 enum ProtocolFamily {
     Http1,
     Http2,
+    Http3,
     Other,
 }
 
@@ -423,6 +436,7 @@ impl ProtocolFamily {
         match self {
             Self::Http1 => "http1",
             Self::Http2 => "http2",
+            Self::Http3 => "http3",
             Self::Other => "other",
         }
     }
@@ -451,6 +465,9 @@ pub struct Scaler {
     pub reused_rtt_samples: Cell<u64>,
     pub skip_growth_sample: Cell<bool>,
     pub reuse_health_low: Cell<bool>,
+    pub last_add_was_stream: Cell<bool>,
+    pub h2_stream_count: Cell<usize>,
+    pub h2_stream_saturated: Cell<bool>,
     last_protocol: Cell<ProtocolFamily>,
 }
 
@@ -483,6 +500,9 @@ impl Scaler {
             reused_rtt_samples: Cell::new(0),
             skip_growth_sample: Cell::new(false),
             reuse_health_low: Cell::new(false),
+            last_add_was_stream: Cell::new(false),
+            h2_stream_count: Cell::new(0),
+            h2_stream_saturated: Cell::new(false),
             last_protocol: Cell::new(ProtocolFamily::Other),
         })
     }
@@ -1473,7 +1493,10 @@ async fn run_download_task_local(
             }
         };
 
-        let _ = conn_fut.await;
+        // Only await conn_fut if it hasn't completed yet (head_fut won the race)
+        if !conn_done {
+            let _ = conn_fut.await;
+        }
         let size = res
             .headers()
             .get(CONTENT_LENGTH)
@@ -1486,6 +1509,17 @@ async fn run_download_task_local(
 
         if !task.dry_run {
             engine.origin_memory.borrow_mut().note_content_length_reliable(&origin, size > 0);
+            // Phase 3c: Parse Alt-Svc from HEAD response for H3 upgrade hint
+            if let Some(h3_port) = crate::quic::parse_alt_svc_h3_port(res.headers()) {
+                engine.origin_memory.borrow_mut().note_protocol(&origin, ProtocolFamily::Http3);
+                if let Ok(mut log_file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(log_file, "alt_svc_h3_cached origin={} port={}", origin, h3_port);
+                }
+            }
         }
 
         size
@@ -1548,6 +1582,30 @@ async fn run_download_task_local(
     let learned_h2_tuning = engine.origin_h2_tunings.borrow_mut().tuning_for_origin(&origin);
     let (http_client, client_tuning) =
         build_http_client(task.http_mode, max_connections, learned_h2_tuning);
+
+    // Initialize H3 client — only available with http3 feature
+    let h3_client: Option<Rc<RefCell<crate::quic::H3Client>>> = {
+        #[cfg(feature = "http3")]
+        {
+            let should_try_h3 = task.http_mode == HttpMode::Http3
+                || (task.http_mode == HttpMode::Auto && protocol_hint == ProtocolFamily::Http3);
+            if should_try_h3 {
+                match crate::quic::H3Client::new() {
+                    Ok(h3) => Some(Rc::new(RefCell::new(h3))),
+                    Err(e) => {
+                        eprintln!("WARNING: Failed to create H3 client: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "http3"))]
+        {
+            None
+        }
+    };
 
     let scaler_config = ScalerConfig {
         min_connections,
@@ -1624,6 +1682,7 @@ async fn run_download_task_local(
             bucket: bucket.clone(),
             scaler: scaler.clone(),
             storage_config: engine.storage_config.clone(),
+            h3_client: h3_client.clone(),
         };
 
         let handle = tokio::task::spawn_local(async move {
@@ -1645,6 +1704,7 @@ async fn run_download_task_local(
     let scaler_control = control.clone();
     let scaler_metrics = metrics.clone();
     let scaler_http_client = http_client.clone();
+    let scaler_h3_client = h3_client.clone();
     let scaler_index_state = index_state.clone();
     let scaler_bucket = bucket.clone();
     let scaler_borrow_limit = task.borrow_limit_mb * MB;
@@ -1821,20 +1881,51 @@ async fn run_download_task_local(
                 }
             } else if current_efficiency < 0.85 * scaler_for_task.peak_efficiency.get() && n_active > min_c {
                 drop_connection_id = weakest_connection;
-            } else if n_active < max_c {
+            } else if n_active < max_c && !scaler_for_task.h2_stream_saturated.get() {
                 if scaler_engine.request_connection() {
                     scaler_for_task.throughput_before_add.set(new_ewma);
                     did_add = true;
-                    scaler_for_task
-                        .slow_start_remaining
-                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol));
-                    scaler_for_task.last_action.set(ScalerAction::Grow);
-                    scaler_leased_connections.set(scaler_leased_connections.get() + 1);
-                    record_protocol_scale_metric(
-                        &scaler_metrics,
-                        dominant_protocol,
-                        ScalerAction::Grow,
-                    );
+                let is_stream_add = dominant_protocol == ProtocolFamily::Http2
+                    && scaler_for_task.reuse_rate.get() > 0.70
+                    && scaler_for_task.reused_rtt_samples.get() >= 2;
+                scaler_for_task.last_add_was_stream.set(is_stream_add);
+                if is_stream_add {
+                    scaler_for_task.h2_stream_count.set(scaler_for_task.h2_stream_count.get() + 1);
+                }
+                // H2 stream saturation detection: if we've added 3+ stream workers
+                // recently without throughput improvement, flag as saturated
+                if is_stream_add && scaler_for_task.h2_stream_count.get() >= 3 {
+                    let prev_throughput = scaler_for_task.throughput_before_add.get();
+                    if prev_throughput > 0.0 && new_ewma < prev_throughput * 1.05 {
+                        if !scaler_for_task.h2_stream_saturated.get() {
+                            log_phase_a_info(
+                                &scaler_log_path,
+                                &format!(
+                                    "h2_stream_saturation_detected stream_count={} throughput_bps={:.0} prev_throughput_bps={:.0}",
+                                    scaler_for_task.h2_stream_count.get(),
+                                    new_ewma,
+                                    prev_throughput,
+                                ),
+                            ).await;
+                            scaler_for_task.h2_stream_saturated.set(true);
+                            SchedulerMetrics::add(&scaler_metrics.h2_stream_saturated_count, 1);
+                        }
+                    } else {
+                        // Throughput improved — not saturated
+                        scaler_for_task.h2_stream_saturated.set(false);
+                    }
+                }
+                scaler_for_task
+                    .slow_start_remaining
+                    .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, is_stream_add));
+                scaler_for_task.last_action.set(ScalerAction::Grow);
+                scaler_leased_connections.set(scaler_leased_connections.get() + 1);
+                record_protocol_scale_metric(
+                    &scaler_metrics,
+                    dominant_protocol,
+                    ScalerAction::Grow,
+                    is_stream_add,
+                );
                     record_max_active_connections(&scaler_metrics, n_active + 1);
                 }
             }
@@ -1855,11 +1946,12 @@ async fn run_download_task_local(
                     scaler_leased_connections
                         .set(scaler_leased_connections.get().saturating_sub(1));
                     scaler_for_task.last_action.set(ScalerAction::Shrink);
-                    record_protocol_scale_metric(
-                        &scaler_metrics,
-                        dominant_protocol,
-                        ScalerAction::Shrink,
-                    );
+                record_protocol_scale_metric(
+                    &scaler_metrics,
+                    dominant_protocol,
+                    ScalerAction::Shrink,
+                    false,
+                );
                     log_phase_a_info(
                         &scaler_log_path,
                         &format!("scale_drop connection_id={} n_active={}", connection_id, scaler_for_task.n_active.get()),
@@ -1895,6 +1987,7 @@ async fn run_download_task_local(
                     bucket: scaler_bucket.clone(),
                     scaler: scaler_for_task.clone(),
                     storage_config: scaler_engine.storage_config.clone(),
+                    h3_client: scaler_h3_client.clone(),
                 };
                 connection_id_counter += 1;
                 let handle = tokio::task::spawn_local(async move {
@@ -2013,10 +2106,14 @@ async fn run_download_task_local(
             learned_h2_tuning.http2_max_send_buffer_bytes,
         ));
     }
-    engine
-        .origin_memory
-        .borrow_mut()
-        .note_protocol(&origin, dominant_protocol);
+    // Phase 3c: Preserve AltSvc Http3 hint — don't overwrite with actual protocol
+    {
+        let mut om = engine.origin_memory.borrow_mut();
+        let current_hint = om.protocol_hint_for_origin(&origin);
+        if current_hint != Some(ProtocolFamily::Http3) {
+            om.note_protocol(&origin, dominant_protocol);
+        }
+    }
     engine
         .origin_memory
         .borrow_mut()
@@ -2617,6 +2714,7 @@ struct ConnectionWorker {
     bucket: Rc<TokenBucket>,
     scaler: Rc<Scaler>,
     storage_config: storage::StorageConfig,
+    h3_client: Option<Rc<RefCell<crate::quic::H3Client>>>,
 }
 
 #[derive(Debug, Default)]
@@ -2787,6 +2885,9 @@ impl ConnectionWorker {
                     ProtocolFamily::Http2 => {
                         SchedulerMetrics::add(&self.metrics.http2_reused_requests, 1);
                     }
+                    ProtocolFamily::Http3 => {
+                        SchedulerMetrics::add(&self.metrics.http3_requests, 1);
+                    }
                     ProtocolFamily::Other => {}
                 }
             }
@@ -2815,6 +2916,9 @@ impl ConnectionWorker {
                             &self.metrics.http2_fresh_handshake_ms,
                             attempt_timing.handshake_cost_ms,
                         );
+                    }
+                    ProtocolFamily::Http3 => {
+                        SchedulerMetrics::add(&self.metrics.http_other_requests, 1);
                     }
                     ProtocolFamily::Other => {}
                 }
@@ -2868,6 +2972,121 @@ impl ConnectionWorker {
         .await;
     }
 
+    /// Live range-download loop using HTTP/3 (QUIC).
+    async fn run_live_h3(self) -> Result<()> {
+        let mut file = if self.dry_run {
+            None
+        } else {
+            let f = storage::open_download_file_for_write_with_config(&self.file_path, &self.storage_config).await?;
+            Some(f)
+        };
+
+        let mut current_range: Option<Rc<ActiveRange>> = None;
+        let mut local_cursor: u64 = 0;
+        let mut max_end: u64 = 0;
+
+        loop {
+            if self.control.is_halted() {
+                return Ok(());
+            }
+
+            if current_range.is_none() {
+                current_range = self.request_work(false).await?;
+                if let Some(ref range) = current_range {
+                    local_cursor = range.cursor.get();
+                    max_end = range.end.get();
+                    self.log_msg(&format!("h3 range#{} bytes={}..{}", range.id, local_cursor, max_end)).await;
+                } else {
+                    return Ok(());
+                }
+            }
+
+            let Some(ref range) = current_range else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+
+            if local_cursor >= max_end {
+                range.status.set(RANGE_STATUS_FINISHED);
+                let _ = self.coordinator_tx.send(WorkRequest {
+                    connection_id: self.connection_id,
+                    tx: oneshot::channel().0,
+                }).await;
+                current_range = None;
+                continue;
+            }
+
+            SchedulerMetrics::add(&self.metrics.http_requests, 1);
+            let request_start = Instant::now();
+
+            let range_val = format!("bytes={}-{}", local_cursor, max_end.saturating_sub(1));
+
+            let server_name = Url::parse(&self.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|s| s.to_owned()))
+                .unwrap_or_else(|| self.origin.clone());
+            let h3_result = {
+                let client = self.h3_client.as_ref().unwrap().borrow();
+                client.get(&self.origin, &server_name, &self.url, Some(&range_val)).await
+            };
+
+            match h3_result {
+                Ok(h3_resp) => {
+                    let request_setup_ms = request_start.elapsed().as_millis() as u64;
+                    SchedulerMetrics::add(&self.metrics.http_setup_ms, request_setup_ms);
+                    SchedulerMetrics::add(&self.metrics.http_ttfb_ms, request_setup_ms);
+
+                    if h3_resp.status != 206 && h3_resp.status != 200 {
+                        if h3_resp.status == 429 {
+                            self.origin_memory.borrow_mut().note_rate_limit(&self.origin);
+                        }
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                        continue;
+                    }
+
+                    let body = h3_resp.body;
+                    let body_len = body.len() as u64;
+
+                    if body_len > 0 {
+                        let mut offset = 0usize;
+                        while offset < body.len() {
+                            let chunk_size = 65536usize;
+                            let end = (offset + chunk_size).min(body.len());
+                            let chunk = &body[offset..end];
+
+                            if !self.bucket.consume(chunk.len()) {
+                                tokio::task::yield_now().await;
+                            }
+
+                            if let Some(ref mut f) = file {
+                                f.write_all_at(local_cursor, chunk).await?;
+                            }
+
+                            local_cursor += chunk.len() as u64;
+                            self.worker_control.transferred_bytes
+                                .set(self.worker_control.transferred_bytes.get() + chunk.len() as u64);
+                            offset = end;
+                        }
+
+                        SchedulerMetrics::add(&self.metrics.http_stream_ms, request_start.elapsed().as_millis() as u64);
+                        self.global_downloaded.set(self.global_downloaded.get() + body_len);
+                    }
+
+                    SchedulerMetrics::add(&self.metrics.http3_requests, 1);
+                    let mut attempt_timing = AttemptTiming { request_setup_ms, ..Default::default() };
+                    self.record_request_classification(
+                        &mut attempt_timing,
+                        request_start.elapsed().as_millis() as u64,
+                        ProtocolFamily::Http3,
+                    ).await;
+                }
+                Err(e) => {
+                    self.log_msg(&format!("h3 error: {}", e)).await;
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+            }
+        }
+    }
     async fn flush_pending_write(
         &self,
         write_tx: &tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
@@ -3008,7 +3227,9 @@ impl ConnectionWorker {
     }
 
     async fn run(self) -> Result<()> {
-        if self.dry_run {
+        if self.h3_client.is_some() {
+            self.run_live_h3().await
+        } else if self.dry_run {
             self.run_dry().await
         } else {
             self.run_live().await
@@ -3305,6 +3526,17 @@ impl ConnectionWorker {
             self.origin_memory
                 .borrow_mut()
                 .note_range_support(&self.origin, supports_ranges);
+
+            // Phase 3c: Inspect Alt-Svc header for H3 upgrade hint
+            if let Some(h3_port) = crate::quic::parse_alt_svc_h3_port(response.headers()) {
+                self.origin_memory
+                    .borrow_mut()
+                    .note_protocol(&self.origin, ProtocolFamily::Http3);
+                self.log_msg(&format!(
+                    "alt_svc_h3_cached origin={} port={}",
+                    self.origin, h3_port,
+                )).await;
+            }
 
             let mut stream = response.into_body();
             let mut stream_failed = None::<String>;
@@ -3971,10 +4203,16 @@ fn update_scaler_signal_stats(scaler: &Rc<Scaler>, sample_bps: f64) -> (f64, f64
     (alpha, cv)
 }
 
-fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>, protocol: ProtocolFamily) -> u32 {
+fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>, protocol: ProtocolFamily, is_stream_add: bool) -> u32 {
     let heartbeat_ms = scaler.config.borrow().heartbeat_ms.max(1) as f64;
     let estimated_ms = scaler.ewma_rtt_ms.get() * 12.0;
     let mut heartbeats = ((estimated_ms / heartbeat_ms).ceil() as u32).clamp(1, 4);
+
+    // Stream adds on H2 have near-zero connection cost — skip slow start entirely
+    if is_stream_add {
+        return 1;
+    }
+
     match protocol {
         ProtocolFamily::Http1 => {
             if scaler.reuse_rate.get() < 0.60 {
@@ -3985,6 +4223,9 @@ fn compute_slow_start_heartbeats(scaler: &Rc<Scaler>, protocol: ProtocolFamily) 
             if scaler.reuse_rate.get() > 0.70 && scaler.reused_rtt_samples.get() >= 2 {
                 heartbeats = heartbeats.saturating_sub(1).clamp(1, 4);
             }
+        }
+        ProtocolFamily::Http3 => {
+            heartbeats = heartbeats.min(2);
         }
         ProtocolFamily::Other => {}
     }
@@ -4230,6 +4471,7 @@ fn record_protocol_request_metric(metrics: &Rc<SchedulerMetrics>, protocol: Prot
     match protocol {
         ProtocolFamily::Http1 => SchedulerMetrics::add(&metrics.http1_requests, 1),
         ProtocolFamily::Http2 => SchedulerMetrics::add(&metrics.http2_requests, 1),
+        ProtocolFamily::Http3 => SchedulerMetrics::add(&metrics.http3_requests, 1),
         ProtocolFamily::Other => SchedulerMetrics::add(&metrics.http_other_requests, 1),
     }
 }
@@ -4238,6 +4480,7 @@ fn record_protocol_scale_metric(
     metrics: &Rc<SchedulerMetrics>,
     protocol: ProtocolFamily,
     action: ScalerAction,
+    is_stream_add: bool,
 ) {
     match (protocol, action) {
         (ProtocolFamily::Http1, ScalerAction::Grow) => {
@@ -4246,11 +4489,22 @@ fn record_protocol_scale_metric(
         (ProtocolFamily::Http1, ScalerAction::Shrink) => {
             SchedulerMetrics::add(&metrics.http1_scale_drops, 1)
         }
+        (ProtocolFamily::Http2, ScalerAction::Grow) if is_stream_add => {
+            SchedulerMetrics::add(&metrics.http2_stream_adds, 1);
+            SchedulerMetrics::add(&metrics.http2_scale_adds, 1)
+        }
         (ProtocolFamily::Http2, ScalerAction::Grow) => {
+            SchedulerMetrics::add(&metrics.http2_conn_adds, 1);
             SchedulerMetrics::add(&metrics.http2_scale_adds, 1)
         }
         (ProtocolFamily::Http2, ScalerAction::Shrink) => {
             SchedulerMetrics::add(&metrics.http2_scale_drops, 1)
+        }
+        (ProtocolFamily::Http3, ScalerAction::Grow) => {
+            SchedulerMetrics::add(&metrics.http3_scale_adds, 1)
+        }
+        (ProtocolFamily::Http3, ScalerAction::Shrink) => {
+            SchedulerMetrics::add(&metrics.http3_scale_drops, 1)
         }
         _ => {}
     }
@@ -4266,6 +4520,7 @@ fn record_max_active_connections(metrics: &Rc<SchedulerMetrics>, n_active: usize
 fn protocol_prefetch_handshake_ms(protocol: ProtocolFamily) -> u64 {
     match protocol {
         ProtocolFamily::Http2 => 250,
+        ProtocolFamily::Http3 => 200,
         ProtocolFamily::Http1 | ProtocolFamily::Other => LIVE_PREFETCH_HANDSHAKE_MS,
     }
 }
@@ -4274,6 +4529,7 @@ fn protocol_growth_shield_min_samples(protocol: ProtocolFamily) -> u64 {
     match protocol {
         ProtocolFamily::Http1 => 1,
         ProtocolFamily::Http2 => MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD,
+        ProtocolFamily::Http3 => 0,
         ProtocolFamily::Other => MIN_REUSED_RTT_SAMPLES_FOR_GROWTH_SHIELD,
     }
 }
@@ -4282,6 +4538,7 @@ fn protocol_growth_shield_multiplier(protocol: ProtocolFamily) -> f64 {
     match protocol {
         ProtocolFamily::Http1 => 1.5,
         ProtocolFamily::Http2 => 1.0,
+        ProtocolFamily::Http3 => 1.0,
         ProtocolFamily::Other => 1.0,
     }
 }
@@ -4290,6 +4547,7 @@ fn protocol_reuse_thresholds(protocol: ProtocolFamily) -> (f64, f64) {
     match protocol {
         ProtocolFamily::Http1 => (0.60, 0.80),
         ProtocolFamily::Http2 => (0.35, 0.60),
+        ProtocolFamily::Http3 => (0.30, 0.55),
         ProtocolFamily::Other => (0.50, 0.70),
     }
 }
@@ -4314,6 +4572,15 @@ fn protocol_effective_add_threshold(protocol: ProtocolFamily, reuse_rate: f64) -
                 0.04
             }
         }
+        ProtocolFamily::Http3 => {
+            if reuse_rate < 0.30 {
+                0.20
+            } else if reuse_rate < 0.55 {
+                0.12
+            } else {
+                0.06
+            }
+        }
         ProtocolFamily::Other => {
             if reuse_rate < 0.50 {
                 0.10
@@ -4336,10 +4603,14 @@ fn compute_protocol_aware_steal_floor_bytes(
         ProtocolFamily::Http2 => {
             if reuse_rate > 0.60 { 0.75 } else { 0.90 }
         }
+        ProtocolFamily::Http3 => {
+            if reuse_rate > 0.55 { 0.70 } else { 0.85 }
+        }
         ProtocolFamily::Other => 1.0,
     };
     let floor = match protocol {
         ProtocolFamily::Http2 => STORAGE_BLOCK_SIZE,
+        ProtocolFamily::Http3 => STORAGE_BLOCK_SIZE,
         ProtocolFamily::Http1 | ProtocolFamily::Other => 2 * STORAGE_BLOCK_SIZE,
     };
     (((bytes_per_heartbeat / 4.0) * modifier).round() as u64).max(floor)
@@ -4398,6 +4669,15 @@ fn build_http_client(
     let http = crate::connector::TunedConnector::new();
     let tuning = learned_tuning.unwrap_or_else(|| compute_http2_client_tuning(expected_concurrency));
     let https = match http_mode {
+        HttpMode::Http3 => {
+            eprintln!("WARNING: HTTP/3 mode selected but the http3 feature is not enabled. Falling back to HTTP/1.1. Rebuild with --features http3 to enable QUIC support.");
+            HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .wrap_connector(http)
+        }
         HttpMode::Auto => HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()

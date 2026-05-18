@@ -1,6 +1,6 @@
 [package]
 name = "tur-rs"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 authors = ["Syed Ali"]
 description = "A relentless, high-concurrency download manager built for speed and efficiency. Tur uses dynamic work-stealing and aligned storage to saturate your bandwidth while maintaining a minuscule memory footprint. Inspired by the legends, built for the modern Rust ecosystem."
@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = []
 linux-io-uring-experimental = []
+http3 = ["quinn", "h3", "h3-quinn", "rustls", "webpki-roots"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -32,7 +33,7 @@ hyper-rustls = { version = "0.27.9", features = ["http1", "http2", "native-tokio
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 indicatif = "0.18.4"
 ratatui = "0.30.0"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "pipe"] }
 serde = { version = "1.0.228", features = ["derive"] }
 socket2 = { version = "0.6.3", features = ["all"] }
 sysinfo = { version = "0.30", default-features = false }
@@ -42,7 +43,29 @@ url = "2.5.7"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Networking_WinSock"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
+
+[dependencies.quinn]
+version = "0.11"
+optional = true
+features = ["runtime-tokio", "rustls-ring"]
+
+[dependencies.h3]
+version = "0.0"
+optional = true
+
+[dependencies.h3-quinn]
+version = "0.0"
+optional = true
+
+[dependencies.rustls]
+version = "0.23"
+optional = true
+features = ["ring"]
+
+[dependencies.webpki-roots]
+version = "0.26"
+optional = true
