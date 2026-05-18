@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
@@ -1126,4 +1126,3 @@ async fn run_download_task_local(
 
     Ok(())
 }
-

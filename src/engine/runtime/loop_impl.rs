@@ -10,6 +10,7 @@ impl DownloadEngine {
         let mut active_controls: HashMap<Uuid, Rc<RuntimeControl>> = HashMap::new();
         let mut paused_tasks: HashMap<Uuid, TaskSnapshot> = HashMap::new();
         let mut persisted_paths: HashMap<Uuid, PathBuf> = HashMap::new();
+        let mut deferred_resumes = HashSet::<Uuid>::new();
         let mut pending_launches = VecDeque::<PendingLaunch>::new();
         let mut last_refill_recompute = Instant::now();
         let mut memory_system = System::new();
@@ -146,10 +147,21 @@ impl DownloadEngine {
                         EngineCommand::Cancel(id) => {
                             if let Some(control) = active_controls.get(&id) {
                                 control.request_persist();
+                            } else if let Some(snapshot) = paused_tasks.remove(&id) {
+                                let path = metadata_path(&snapshot.task);
+                                persist_snapshot(&path, &snapshot)?;
+                                persisted_paths.insert(snapshot.task.id, path);
+                                let _ = event_tx
+                                    .send(EngineEvent::StatusChanged(
+                                        snapshot.task.id,
+                                        DownloadStatus::Stopped,
+                                    ))
+                                    .await;
                             }
                         }
                         EngineCommand::Resume(id) => {
                             if active_controls.contains_key(&id) {
+                                deferred_resumes.insert(id);
                                 continue;
                             }
 
@@ -196,13 +208,17 @@ impl DownloadEngine {
 
                             match halt_mode {
                                 HaltMode::PauseMemory => {
-                                    paused_tasks.insert(snapshot.task.id, snapshot.clone());
-                                    let _ = event_tx
-                                        .send(EngineEvent::StatusChanged(
-                                            snapshot.task.id,
-                                            DownloadStatus::Paused,
-                                        ))
-                                        .await;
+                                    if deferred_resumes.remove(&snapshot.task.id) {
+                                        pending_launches.push_back(PendingLaunch::Resume(snapshot));
+                                    } else {
+                                        paused_tasks.insert(snapshot.task.id, snapshot.clone());
+                                        let _ = event_tx
+                                            .send(EngineEvent::StatusChanged(
+                                                snapshot.task.id,
+                                                DownloadStatus::Paused,
+                                            ))
+                                            .await;
+                                    }
                                 }
                                 HaltMode::PersistToDisk => {
                                     let path = metadata_path(&snapshot.task);

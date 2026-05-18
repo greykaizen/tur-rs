@@ -1,6 +1,8 @@
 use hyper::Uri;
 use hyper_util::client::legacy::connect::HttpConnector;
 use socket2::{SockRef, TcpKeepalive};
+#[cfg(target_os = "linux")]
+use std::io::ErrorKind;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -52,7 +54,9 @@ impl Service<Uri> for TunedConnector {
 
                 if let Err(_err) = sock.set_tcp_congestion(b"bbr") {
                     #[cfg(debug_assertions)]
-                    eprintln!("DEBUG: TCP_CONGESTION(bbr) failed: {}", _err);
+                    if _err.kind() != ErrorKind::NotFound {
+                        eprintln!("DEBUG: TCP_CONGESTION(bbr) failed: {}", _err);
+                    }
                 }
             }
 
