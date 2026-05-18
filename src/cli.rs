@@ -72,7 +72,7 @@ pub struct Cli {
     pub per_download_limit: u64,
 
     /// Disable Linux pwrite zero-copy write path
-    #[arg(long = "no-pwrite", alias = "no-splice", default_value_t = false)]
+    #[arg(long = "no-pwrite", default_value_t = false)]
     pub no_pwrite: bool,
 
     /// Disable Linux kernel splice() zero-copy write path (pipe+splice)

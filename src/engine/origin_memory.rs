@@ -322,3 +322,51 @@ fn origin_memory_path() -> PathBuf {
     }
     PathBuf::from(".tur-origin-memory.bin")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_memory_persists_across_reload() {
+        let base = std::env::temp_dir().join(format!("tur-origin-memory-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &base);
+        }
+
+        let origin = "https://example.com:443";
+        let tuning = ClientTuning {
+            expected_concurrency: 4,
+            http2_stream_window_bytes: 4 * MB as u32,
+            http2_connection_window_bytes: 16 * MB as u32,
+            http2_max_send_buffer_bytes: 2 * MB as usize,
+            source: H2TuningSource::LearnedOrigin,
+        };
+
+        let mut store = OriginMemoryStore::load_enabled(true);
+        store.note_protocol(origin, ProtocolFamily::Http2);
+        store.note_phi_ratio(origin, 1.7);
+        store.note_h2_tuning(origin, tuning);
+
+        let mut reloaded = OriginMemoryStore::load_enabled(true);
+        assert_eq!(reloaded.protocol_hint_for_origin(origin), Some(ProtocolFamily::Http2));
+        assert_eq!(
+            reloaded.hydrate_phi_ratios().current_ratio(origin),
+            Some(1.7)
+        );
+        assert_eq!(
+            reloaded
+                .hydrate_h2_tunings()
+                .current_tuning(origin)
+                .unwrap()
+                .source,
+            H2TuningSource::OriginMemoryHint
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+    }
+}

@@ -208,3 +208,42 @@ pub async fn open_download_file_for_write_with_config(
 ) -> Result<DownloadFile> {
     platform::open_download_file_for_write(path, config).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selects_a_supported_backend_for_current_platform() {
+        let dir = std::env::temp_dir().join(format!("tur-storage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        prepare_download_file(&path, 8192).unwrap();
+
+        let file = open_download_file_for_write_with_config(&path, &StorageConfig::default())
+            .await
+            .unwrap();
+        let backend = file.backend();
+
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            backend,
+            StorageBackendKind::LinuxIoUring
+                | StorageBackendKind::LinuxSplice
+                | StorageBackendKind::LinuxPwrite
+                | StorageBackendKind::LinuxTokio
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(matches!(backend, StorageBackendKind::MacosPwrite));
+        #[cfg(target_os = "windows")]
+        assert!(matches!(
+            backend,
+            StorageBackendKind::WindowsDirectIo | StorageBackendKind::WindowsPwrite
+        ));
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        assert!(matches!(backend, StorageBackendKind::Standard));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
