@@ -19,6 +19,12 @@ jobs:
         run: cargo test
       - name: Check all features
         run: cargo check --all-features
+      - name: Test all features
+        run: cargo test --all-features
+      - name: Package
+        run: cargo package
+      - name: Publish dry run
+        run: cargo publish --dry-run
 
   cross-target-check:
     strategy:
@@ -39,5 +45,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - name: Check target
+      - name: Check target (default features)
         run: cargo check --target ${{ matrix.target }}
+      - name: Check target (no default features)
+        run: cargo check --target ${{ matrix.target }} --no-default-features
