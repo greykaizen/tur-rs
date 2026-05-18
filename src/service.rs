@@ -813,11 +813,7 @@ impl TurService {
                             Some((id, DownloadUpdate::StatusChanged(DownloadStatus::Completed)))
                         }
                         EngineEvent::StatusChanged(id, status) => {
-                            let is_terminal = matches!(status,
-                                DownloadStatus::Stopped
-                                | DownloadStatus::Paused
-                                | DownloadStatus::Error(_)
-                            );
+                            let is_terminal = matches!(status, DownloadStatus::Error(_));
                             if is_terminal {
                                 let _ = handles.borrow_mut().remove(&id);
                             }
