@@ -1,6 +1,6 @@
 [package]
 name = "tur-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Syed Ali"]
 description = "A relentless, high-concurrency download manager built for speed and efficiency. Tur uses dynamic work-stealing and aligned storage to saturate your bandwidth while maintaining a minuscule memory footprint. Inspired by the legends, built for the modern Rust ecosystem."

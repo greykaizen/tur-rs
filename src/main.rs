@@ -29,16 +29,15 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let runtime = if cli.runtime_threads <= 1 {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-    } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cli.runtime_threads)
-            .enable_all()
-            .build()?
-    };
+    if cli.runtime_threads > 1 {
+        eprintln!(
+            "WARNING: --runtime-threads={} is currently orchestration-only. Worker execution still runs on the LocalSet, so tur is using a single-threaded runtime until the 0.6.x Send-safe worker split lands.",
+            cli.runtime_threads
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let local = LocalSet::new();
     local.block_on(&runtime, async_main(cli))
 }
