@@ -568,12 +568,17 @@ impl ConnectionWorker {
             let mut stream_failed = None::<String>;
             let stream_started = Instant::now();
             let mut first_chunk_at: Option<Instant> = None;
+            let mut halted_during_stream = false;
             while let Some(frame_result) = stream.frame().await {
                 if self.control.is_halted() {
                     self
                         .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
                         .await?;
-                    return Ok(());
+                    self.relinquish_range(&range, local_cursor).await;
+                    current_range = None;
+                    current_range_id = None;
+                    halted_during_stream = true;
+                    break;
                 }
 
                 let frame = match frame_result {
@@ -700,6 +705,17 @@ impl ConnectionWorker {
                         .await?;
                 }
 
+                if self.control.is_halted() {
+                    self
+                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
+                        .await?;
+                    self.relinquish_range(&range, local_cursor).await;
+                    current_range = None;
+                    current_range_id = None;
+                    halted_during_stream = true;
+                    break;
+                }
+
                 let remaining = max_end.saturating_sub(new_pos);
                 let prefetch_trigger_bytes = compute_prefetch_trigger_bytes(
                     remaining,
@@ -765,6 +781,11 @@ impl ConnectionWorker {
             attempt_timing.stream_ms = stream_started.elapsed().as_millis() as u64;
             SchedulerMetrics::add(&self.metrics.http_stream_ms, attempt_timing.stream_ms);
 
+            if halted_during_stream {
+                self.reset_pending_write_target(&mut pending_write);
+                break;
+            }
+
             if let Some(reason) = stream_failed {
                 self
                     .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
@@ -820,6 +841,18 @@ impl ConnectionWorker {
                 self.log_attempt_summary(&range, start, end, &attempt_timing, "partial", http_version)
                     .await;
                 self.reset_pending_write_target(&mut pending_write);
+            }
+        }
+
+        if self.control.is_halted() {
+            if let Some(range) = current_range.take() {
+                self.relinquish_range(&range, local_cursor).await;
+            }
+            if let Some(range) = prefetched_range.take() {
+                self.relinquish_range(&range, range.cursor.get()).await;
+            }
+            if let Some(handle) = prefetch_handle.take() {
+                handle.abort();
             }
         }
 

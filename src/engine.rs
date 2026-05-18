@@ -1098,6 +1098,15 @@ async fn run_download_task_local(
         metrics.max_ewma_write_latency_x10.get() as f64 / 10.0,
     ));
 
+    if task.total_size > 0 && global_downloaded.get() >= task.total_size {
+        let _ = std::fs::remove_file(metadata_path(&task));
+        let _ = event_tx
+            .send(EngineEvent::Progress(task.id, global_downloaded.get(), 0.0))
+            .await;
+        let _ = event_tx
+            .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Completed))
+            .await;
+    } else {
     match control.halt_mode() {
         HaltMode::Running => {
             let _ = std::fs::remove_file(metadata_path(&task));
@@ -1122,6 +1131,7 @@ async fn run_download_task_local(
                 .send(EngineCommand::RuntimeStopped(snapshot, halt_mode))
                 .await;
         }
+    }
     }
 
     Ok(())
