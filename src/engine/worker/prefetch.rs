@@ -12,6 +12,8 @@ impl ConnectionWorker {
 
         loop {
             if self.control.is_halted() || self.should_exit_for_scale_down() {
+                self.set_worker_state(WorkerState::Paused, Some("halt requested".to_string()));
+                self.clear_worker_range();
                 break;
             }
 
@@ -23,19 +25,26 @@ impl ConnectionWorker {
             }
 
             if current_range.is_none() {
+                self.set_worker_state(WorkerState::WaitingForWork, None);
+                self.clear_worker_range();
                 if let Some(range) = prefetched_range.take() {
                     SchedulerMetrics::add(&self.metrics.prefetch_hits, 1);
                     current_range = Some(range.clone());
                     range_started_at = Instant::now();
                     local_cursor = range.cursor.get();
                     range_start_cursor = local_cursor;
+                    self.set_worker_state(WorkerState::Downloading, Some("prefetched".to_string()));
+                    self.set_worker_range(&range, local_cursor);
                 } else {
                     current_range = self.request_work(false).await?;
                     if let Some(range) = &current_range {
                         range_started_at = Instant::now();
                         local_cursor = range.cursor.get();
                         range_start_cursor = local_cursor;
+                        self.set_worker_state(WorkerState::Downloading, None);
+                        self.set_worker_range(range, local_cursor);
                     } else {
+                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
                         break;
                     }
                 }
@@ -45,6 +54,8 @@ impl ConnectionWorker {
             let end = range.end.get();
             if local_cursor >= end {
                 range.status.set(RANGE_STATUS_FINISHED);
+                self.set_worker_state(WorkerState::Finished, Some("range complete".to_string()));
+                self.clear_worker_range();
                 current_range = None;
                 continue;
             }
@@ -61,6 +72,9 @@ impl ConnectionWorker {
                 .transferred_bytes
                 .set(self.worker_control.transferred_bytes.get().saturating_add(step));
             let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
+            self.worker_control.diagnostics.set_speed_bps(recent_speed_bps);
+            self.set_worker_state(WorkerState::Downloading, None);
+            self.set_worker_range(&range, local_cursor);
 
             let remaining = end.saturating_sub(new_pos);
             let prefetch_trigger_bytes = compute_prefetch_trigger_bytes(
@@ -93,6 +107,10 @@ impl ConnectionWorker {
 
         if let Some(handle) = prefetch_handle {
             handle.abort();
+        }
+        if !self.control.is_halted() && !self.should_exit_for_scale_down() {
+            self.set_worker_state(WorkerState::Finished, Some("worker complete".to_string()));
+            self.clear_worker_range();
         }
         Ok(())
     }

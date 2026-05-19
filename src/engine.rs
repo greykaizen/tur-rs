@@ -639,11 +639,11 @@ async fn run_download_task_local(
             .await;
 
             let n_active = scaler_for_task.n_active.get();
-            if n_active == 0 {
-                continue;
-            }
-
-            let current_efficiency = new_ewma / n_active as f64;
+            let current_efficiency = if n_active > 0 {
+                new_ewma / n_active as f64
+            } else {
+                0.0
+            };
             let peak = scaler_for_task.peak_efficiency.get();
             if current_efficiency > peak {
                 scaler_for_task.peak_efficiency.set(current_efficiency);
@@ -678,6 +678,9 @@ async fn run_download_task_local(
                     let score = prev_delta.saturating_add(current_delta);
                     if current_delta > 0 {
                         connection_speeds.push(current_delta as f64 / interval_secs);
+                    }
+                    if !matches!(slot.control.diagnostics.state(), WorkerState::Downloading) {
+                        continue;
                     }
                     match weakest {
                         Some((_, best_score)) if best_score <= score => {}
@@ -735,6 +738,71 @@ async fn run_download_task_local(
                 ),
             )
             .await;
+
+            if n_active == 0 {
+                if scaler_engine.request_connection() {
+                    let worker_control = WorkerControl::new(connection_id_counter);
+                    worker_control.pending_growth_probe.set(true);
+                    let worker = ConnectionWorker {
+                        connection_id: connection_id_counter,
+                        url: scaler_url.clone(),
+                        origin: scaler_origin.clone(),
+                        file_path: scaler_file_path.clone(),
+                        log_path: scaler_log_path.clone(),
+                        coordinator_tx: scaler_work_tx.clone(),
+                        global_downloaded: scaler_global_downloaded.clone(),
+                        control: scaler_control.clone(),
+                        worker_control: worker_control.clone(),
+                        dry_run: scaler_dry_run,
+                        borrow_limit_bytes: scaler_borrow_limit,
+                        adaptive_minimum_steal_bytes: scaler_adaptive_minimum_steal_bytes.clone(),
+                        write_buffer_cap_bytes: write_buffer_cap_bytes.clone(),
+                        total_size,
+                        origin_memory: scaler_engine.origin_memory.clone(),
+                        shared_write_latency_ms: shared_write_latency_ms.clone(),
+                        ewma_connection_rtt_ms: Cell::new(200.0),
+                        metrics: scaler_metrics.clone(),
+                        client: scaler_http_client.clone(),
+                        index_state: scaler_index_state.clone(),
+                        bucket: scaler_bucket.clone(),
+                        scaler: scaler_for_task.clone(),
+                        storage_config: scaler_engine.storage_config.clone(),
+                        h3_client: scaler_h3_client.clone(),
+                        request_headers: request_headers.clone(),
+                    };
+                    connection_id_counter += 1;
+                    let handle = tokio::task::spawn_local(async move {
+                        let _ = worker.run().await;
+                    });
+                    scaler_handles.borrow_mut().push(WorkerSlot {
+                        control: worker_control,
+                        handle,
+                    });
+                    scaler_for_task.n_active.set(1);
+                    scaler_leased_connections.set(scaler_leased_connections.get() + 1);
+                    scaler_for_task.last_action.set(ScalerAction::Grow);
+                    scaler_for_task
+                        .slow_start_remaining
+                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, false));
+                    record_protocol_scale_metric(
+                        &scaler_metrics,
+                        dominant_protocol,
+                        ScalerAction::Grow,
+                        false,
+                    );
+                    record_max_active_connections(&scaler_metrics, 1);
+                    log_phase_a_info(
+                        &scaler_log_path,
+                        &format!(
+                            "scale_recover connection_id={} n_active=1 slow_start_remaining={}",
+                            connection_id_counter - 1,
+                            scaler_for_task.slow_start_remaining.get(),
+                        ),
+                    )
+                    .await;
+                }
+                continue;
+            }
 
             if last_action == ScalerAction::Grow {
                 let prev = scaler_for_task.throughput_before_add.get();

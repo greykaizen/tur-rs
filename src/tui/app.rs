@@ -180,7 +180,7 @@ impl TuiApp {
                                 self.detail_scroll = 0;
                             }
                         }
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                        KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char('s') | KeyCode::Char('S') => {
                             self.send_command(EngineCommand::Stop)
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {

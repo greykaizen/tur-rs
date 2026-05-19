@@ -108,7 +108,7 @@ impl TuiApp {
         // Input or Commands
         let help_text = match self.input_mode {
             InputMode::Normal => {
-                "[q]uit [n]ew [d]etails [tab] focus [s]pause [r]resume [c]persist-stop ↑↓ move/scroll"
+                "[q]uit [n]ew [d]etails [tab] focus [p]ause [r]esume [c]ancel/stop ↑↓ move/scroll"
             }
             InputMode::UrlInput => &format!("Enter URL: {}_", self.url_buffer),
             InputMode::DirInput => {

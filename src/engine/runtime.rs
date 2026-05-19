@@ -118,6 +118,10 @@ impl WorkerDiagnosticsState {
         }
     }
 
+    pub(super) fn state(&self) -> WorkerState {
+        self.state.get()
+    }
+
     pub(super) fn set_detail(&self, detail: Option<String>) {
         *self.detail.borrow_mut() = detail;
     }
