@@ -12,6 +12,15 @@ impl ConnectionWorker {
 
         loop {
             if self.control.is_halted() || self.should_exit_for_scale_down() {
+                if let Some(range) = current_range.take() {
+                    self.relinquish_range(&range, local_cursor).await;
+                }
+                if let Some(range) = prefetched_range.take() {
+                    self.relinquish_range(&range, range.cursor.get()).await;
+                }
+                if let Some(handle) = prefetch_handle.take() {
+                    handle.abort();
+                }
                 self.set_worker_state(WorkerState::Paused, Some("halt requested".to_string()));
                 self.clear_worker_range();
                 break;

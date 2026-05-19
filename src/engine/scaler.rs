@@ -69,6 +69,12 @@ pub(crate) enum ProtocolFamily {
     Other,
 }
 
+impl Default for ProtocolFamily {
+    fn default() -> Self {
+        Self::Other
+    }
+}
+
 impl ProtocolFamily {
     pub(super) fn as_str(self) -> &'static str {
         match self {

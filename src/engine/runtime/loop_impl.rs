@@ -81,10 +81,11 @@ impl DownloadEngine {
                             }
                             PendingLaunch::Resume(snapshot) => {
                                 let task = snapshot.task.clone();
+                                let heartbeat_ms = snapshot.resume_state.heartbeat_ms.max(500);
                                 let control = Rc::new(RuntimeControl::new(ScalerConfig {
                                     min_connections: task.min_connections,
                                     max_connections: task.max_connections,
-                                    heartbeat_ms: 2000,
+                                    heartbeat_ms,
                                 }));
                                 active_controls.insert(task.id, control.clone());
 

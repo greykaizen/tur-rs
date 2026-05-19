@@ -86,7 +86,7 @@ pub use types::{
 };
 
 use coordinator::{
-    Coordinator, IndexStateMap, TaskSnapshot, INITIAL_PHI_MAX_RATIO,
+    Coordinator, IndexStateMap, ResumeBootstrap, TaskSnapshot, INITIAL_PHI_MAX_RATIO,
     RANGE_STATUS_FINISHED, RANGE_STATUS_PENDING, STORAGE_BLOCK_SIZE, UNASSIGNED_CONNECTION,
 };
 use http::{
@@ -291,11 +291,20 @@ async fn run_download_task_local(
     let log_path = log_path(&task);
     ensure_parent_dir(&log_path)?;
     let metrics = Rc::new(SchedulerMetrics::default());
-    let protocol_hint = engine
-        .origin_memory
-        .borrow_mut()
-        .protocol_hint_for_origin(&origin)
-        .unwrap_or(ProtocolFamily::Other);
+    let is_resume = snapshot.is_some();
+    let resume_state = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.resume_state.clone())
+        .unwrap_or_default();
+    let protocol_hint = if is_resume && !matches!(resume_state.protocol_hint, ProtocolFamily::Other) {
+        resume_state.protocol_hint
+    } else {
+        engine
+            .origin_memory
+            .borrow_mut()
+            .protocol_hint_for_origin(&origin)
+            .unwrap_or(ProtocolFamily::Other)
+    };
     let phi_max_ratio = engine.origin_phi_ratios.borrow_mut().ratio_for_origin(&origin);
     let origin_memory_hit = engine.origin_memory.borrow().memory_hit_for_origin(&origin);
     let shared_write_latency_ms = Rc::new(Cell::new(10.0));
@@ -304,9 +313,10 @@ async fn run_download_task_local(
         (task.borrow_limit_mb.max(1) * MB).max(2 * STORAGE_BLOCK_SIZE),
     ));
 
-    // Set up connection acquisition state early so HEAD and connections can run concurrently
+    // Set up connection acquisition state early so HEAD and connections can run concurrently.
+    // Resume paths may override the initial target later using persisted bootstrap state.
     let leased_connections = Rc::new(Cell::new(0usize));
-    let desired_initial_connections = task.connections.max(1);
+    let mut desired_initial_connections = task.connections.max(1);
 
     let total_size = if let Some(snapshot) = &snapshot {
         snapshot.task.total_size
@@ -441,7 +451,11 @@ async fn run_download_task_local(
 
     let min_connections = task.min_connections.max(1).min(task.max_connections.max(1));
     let max_connections = task.max_connections.max(min_connections);
+    if is_resume && resume_state.target_connections > 0 {
+        task.connections = resume_state.target_connections;
+    }
     task.connections = task.connections.clamp(min_connections, max_connections);
+    desired_initial_connections = task.connections.max(1);
     let (work_tx, work_rx) = mpsc::channel(128);
     let learned_h2_tuning = engine.origin_h2_tunings.borrow_mut().tuning_for_origin(&origin);
     let (http_client, client_tuning) =
@@ -482,6 +496,17 @@ async fn run_download_task_local(
     }
     let scaler = Scaler::from_config_handle(control.scaler_config());
     scaler.last_protocol.set(protocol_hint);
+    if is_resume {
+        if resume_state.ewma_throughput_bps > 0.0 {
+            scaler.ewma_throughput.set(resume_state.ewma_throughput_bps);
+        }
+        if resume_state.peak_efficiency_bps > 0.0 {
+            scaler.peak_efficiency.set(resume_state.peak_efficiency_bps);
+        }
+        scaler.reuse_rate.set(resume_state.reuse_rate.clamp(0.0, 1.0));
+        scaler.slow_start_remaining.set(1);
+        scaler.last_action.set(ScalerAction::Hold);
+    }
     let scaler_engine = engine.clone();
 
     let handles = Rc::new(RefCell::new(Vec::<WorkerSlot>::new()));
@@ -520,6 +545,21 @@ async fn run_download_task_local(
     let request_headers = build_request_headers(&task);
     scaler.n_active.set(initial_connections);
     record_max_active_connections(&metrics, initial_connections);
+    if is_resume {
+        log_phase_a_info(
+            &log_path,
+            &format!(
+                "resume_bootstrap target_connections={} initial_connections={} protocol_hint={} ewma_throughput_bps={:.0} reuse_rate={:.2} heartbeat_ms={}",
+                task.connections,
+                initial_connections,
+                protocol_hint.as_str(),
+                scaler.ewma_throughput.get(),
+                scaler.reuse_rate.get(),
+                control.scaler_config().borrow().heartbeat_ms,
+            ),
+        )
+        .await;
+    }
         for connection_id in 0..initial_connections {
         let worker_control = WorkerControl::new(connection_id as u32);
         worker_control.pending_growth_probe.set(false);
@@ -1231,6 +1271,18 @@ async fn run_download_task_local(
             let snapshot = TaskSnapshot {
                 task,
                 coordinator: coordinator.snapshot(),
+                resume_state: ResumeBootstrap {
+                    target_connections: scaler
+                        .n_active
+                        .get()
+                        .max(control.scaler_config().borrow().min_connections)
+                        .max(1),
+                    protocol_hint: scaler.last_protocol.get(),
+                    ewma_throughput_bps: scaler.ewma_throughput.get(),
+                    peak_efficiency_bps: scaler.peak_efficiency.get(),
+                    reuse_rate: scaler.reuse_rate.get(),
+                    heartbeat_ms: control.scaler_config().borrow().heartbeat_ms.max(500),
+                },
             };
             let _ = cmd_tx
                 .send(EngineCommand::RuntimeStopped(snapshot, halt_mode))

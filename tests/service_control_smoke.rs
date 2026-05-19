@@ -19,7 +19,7 @@ where
     let _guard = TEST_MUTEX
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("serialize service control smoke tests");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     #[cfg(feature = "http3")]
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

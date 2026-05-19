@@ -68,6 +68,18 @@ pub struct CoordinatorSnapshot {
 pub struct TaskSnapshot {
     pub(super) task: DownloadTask,
     pub(super) coordinator: CoordinatorSnapshot,
+    #[serde(default)]
+    pub(super) resume_state: ResumeBootstrap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResumeBootstrap {
+    pub(super) target_connections: usize,
+    pub(super) protocol_hint: ProtocolFamily,
+    pub(super) ewma_throughput_bps: f64,
+    pub(super) peak_efficiency_bps: f64,
+    pub(super) reuse_rate: f64,
+    pub(super) heartbeat_ms: u64,
 }
 
 #[derive(Debug)]
