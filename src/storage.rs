@@ -53,6 +53,9 @@ impl Default for StorageConfig {
 }
 
 pub fn prepare_download_file(path: &Path, total_size: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let file = std::fs::File::create(path)?;
     file.set_len(total_size)?;
     platform::prepare_download_file(&file, total_size)?;

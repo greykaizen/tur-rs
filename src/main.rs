@@ -295,6 +295,7 @@ async fn run_headless(cli: Cli) -> Result<()> {
             EngineEvent::TotalSize(id, total) => {
                 println!("size task={} total_bytes={}", id, total);
             }
+            EngineEvent::Workers(_, _) => {}
             EngineEvent::StatusChanged(id, status) => {
                 println!("status task={} {:?}", id, status);
                 if matches!(status, DownloadStatus::Error(_)) {

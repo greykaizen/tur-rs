@@ -528,6 +528,8 @@ pub enum DownloadUpdate {
     },
     /// Final file size discovered (may arrive well after the first progress event).
     TotalSize(u64),
+    /// Periodic worker/connection diagnostics.
+    Workers(Vec<crate::engine::WorkerSnapshot>),
     /// Task status transition.
     StatusChanged(DownloadStatus),
 }
@@ -807,6 +809,9 @@ impl TurService {
                         }
                         EngineEvent::TotalSize(id, size) => {
                             Some((id, DownloadUpdate::TotalSize(size)))
+                        }
+                        EngineEvent::Workers(id, workers) => {
+                            Some((id, DownloadUpdate::Workers(workers)))
                         }
                         EngineEvent::StatusChanged(id, DownloadStatus::Completed) => {
                             let _ = handles.borrow_mut().remove(&id);

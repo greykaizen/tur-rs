@@ -82,7 +82,7 @@ mod worker;
 pub use runtime::DownloadEngine;
 pub use types::{
     ActiveRange, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HaltMode, HttpMode,
-    ScheduleMode, WorkRequest,
+    ScheduleMode, WorkRequest, WorkerSnapshot, WorkerState,
 };
 
 use coordinator::{
@@ -886,6 +886,7 @@ async fn run_download_task_local(
     let progress_counter = global_downloaded.clone();
     let progress_control = control.clone();
     let progress_total = total_size;
+    let progress_handles = handles.clone();
     let progress_handle = tokio::task::spawn_local(async move {
         let mut last_downloaded = progress_counter.get();
         let mut last_tick = Instant::now();
@@ -905,6 +906,19 @@ async fn run_download_task_local(
 
             let _ = progress_tx
                 .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
+                .await;
+            let worker_snapshots = {
+                let slots = progress_handles.borrow();
+                slots.iter()
+                    .map(|slot| {
+                        slot.control
+                            .diagnostics
+                            .snapshot(slot.control.transferred_bytes.get())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let _ = progress_tx
+                .send(EngineEvent::Workers(progress_task_id, worker_snapshots))
                 .await;
 
             last_downloaded = current_downloaded;

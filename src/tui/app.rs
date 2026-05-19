@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +18,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::engine::{
-    DownloadTask, DownloadStatus, EngineEvent, EngineCommand, HttpMode, ScheduleMode,
+    DownloadTask, DownloadStatus, EngineCommand, EngineEvent, HttpMode, ScheduleMode,
+    WorkerSnapshot,
 };
 use crate::service::RequestContext;
 
@@ -25,10 +27,12 @@ use super::input::InputMode;
 
 pub struct TuiApp {
     pub(super) tasks: Vec<DownloadTask>,
+    pub(super) worker_snapshots: HashMap<Uuid, Vec<WorkerSnapshot>>,
     pub(super) list_state: ListState,
     pub(super) input_mode: InputMode,
     pub(super) url_buffer: String,
     pub(super) dir_buffer: String,
+    pub(super) show_details: bool,
     engine_tx: mpsc::Sender<EngineCommand>,
     default_connections: usize,
     min_connections: usize,
@@ -60,10 +64,12 @@ impl TuiApp {
     ) -> Self {
         Self {
             tasks: Vec::new(),
+            worker_snapshots: HashMap::new(),
             list_state: ListState::default(),
             input_mode: InputMode::Normal,
             url_buffer: String::new(),
             dir_buffer: String::new(),
+            show_details: true,
             engine_tx,
             default_connections,
             min_connections,
@@ -80,7 +86,16 @@ impl TuiApp {
     }
 
     pub fn add_task(&mut self, url: String, dir: PathBuf) {
-        let filename = url.split('/').last().unwrap_or("unknown").to_string();
+        let filename = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .path_segments()
+                    .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
+                    .map(ToOwned::to_owned)
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "download.bin".to_string());
         let task = DownloadTask {
             id: Uuid::new_v4(),
             url,
@@ -129,62 +144,63 @@ impl TuiApp {
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(0));
 
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match self.input_mode {
-                        InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Up => self.prev(),
-                            KeyCode::Down => self.next(),
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                self.input_mode = InputMode::UrlInput;
-                                self.url_buffer.clear();
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                self.send_command(EngineCommand::Stop)
-                            }
-                            KeyCode::Char('r') | KeyCode::Char('R') => {
-                                self.send_command(EngineCommand::Resume)
-                            }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                self.send_command(EngineCommand::Cancel)
-                            }
-                            _ => {}
-                        },
-                        InputMode::UrlInput => match key.code {
-                            KeyCode::Enter => {
-                                self.input_mode = InputMode::DirInput;
-                                self.dir_buffer.clear();
-                            }
-                            KeyCode::Esc => self.input_mode = InputMode::Normal,
-                            KeyCode::Char(c) => self.url_buffer.push(c),
-                            KeyCode::Backspace => {
-                                self.url_buffer.pop();
-                            }
-                            _ => {}
-                        },
-                        InputMode::DirInput => match key.code {
-                            KeyCode::Enter => {
-                                let url = self.url_buffer.clone();
-                                let dir = if self.dir_buffer.is_empty() {
-                                    PathBuf::from(".")
-                                } else {
-                                    PathBuf::from(&self.dir_buffer)
-                                };
-                                self.add_task(url, dir);
-                                self.input_mode = InputMode::Normal;
-                            }
-                            KeyCode::Esc => self.input_mode = InputMode::Normal,
-                            KeyCode::Char(c) => self.dir_buffer.push(c),
-                            KeyCode::Backspace => {
-                                self.dir_buffer.pop();
-                            }
-                            _ => {}
-                        },
-                    }
+            if let Some(Event::Key(key)) = next_terminal_event(timeout).await? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match self.input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Up => self.prev(),
+                        KeyCode::Down => self.next(),
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            self.input_mode = InputMode::UrlInput;
+                            self.url_buffer.clear();
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            self.show_details = !self.show_details;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            self.send_command(EngineCommand::Stop)
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            self.send_command(EngineCommand::Resume)
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            self.send_command(EngineCommand::Cancel)
+                        }
+                        _ => {}
+                    },
+                    InputMode::UrlInput => match key.code {
+                        KeyCode::Enter => {
+                            self.input_mode = InputMode::DirInput;
+                            self.dir_buffer.clear();
+                        }
+                        KeyCode::Esc => self.input_mode = InputMode::Normal,
+                        KeyCode::Char(c) => self.url_buffer.push(c),
+                        KeyCode::Backspace => {
+                            self.url_buffer.pop();
+                        }
+                        _ => {}
+                    },
+                    InputMode::DirInput => match key.code {
+                        KeyCode::Enter => {
+                            let url = self.url_buffer.clone();
+                            let dir = if self.dir_buffer.is_empty() {
+                                PathBuf::from(".")
+                            } else {
+                                PathBuf::from(&self.dir_buffer)
+                            };
+                            self.add_task(url, dir);
+                            self.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Esc => self.input_mode = InputMode::Normal,
+                        KeyCode::Char(c) => self.dir_buffer.push(c),
+                        KeyCode::Backspace => {
+                            self.dir_buffer.pop();
+                        }
+                        _ => {}
+                    },
                 }
             }
 
@@ -225,6 +241,9 @@ impl TuiApp {
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
                     task.total_size = size;
                 }
+            }
+            EngineEvent::Workers(id, workers) => {
+                self.worker_snapshots.insert(id, workers);
             }
         }
     }
@@ -267,4 +286,16 @@ impl TuiApp {
             self.list_state.select(Some(i));
         }
     }
+}
+
+async fn next_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
+    tokio::task::spawn_blocking(move || {
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|err| io::Error::other(format!("terminal event task failed: {err}")))?
 }

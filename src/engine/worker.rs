@@ -83,6 +83,21 @@ pub(super) enum RetryHint {
 }
 
 impl ConnectionWorker {
+    fn set_worker_state(&self, state: WorkerState, detail: Option<String>) {
+        self.worker_control.diagnostics.set_state(state);
+        self.worker_control.diagnostics.set_detail(detail);
+    }
+
+    fn set_worker_range(&self, range: &Rc<ActiveRange>, cursor: u64) {
+        self.worker_control
+            .diagnostics
+            .set_range(range.byte_start, range.end.get(), cursor);
+    }
+
+    fn clear_worker_range(&self) {
+        self.worker_control.diagnostics.clear_range();
+    }
+
     fn effective_prefetch_limit_bytes(&self) -> u64 {
         let base_limit = if is_tail_phase_bytes(self.global_downloaded.get(), self.total_size) {
             self.borrow_limit_bytes.min(MB).max(MB)
@@ -105,6 +120,8 @@ impl ConnectionWorker {
         range.cursor.set(local_cursor);
         range.assigned_to.set(UNASSIGNED_CONNECTION);
         range.status.set(RANGE_STATUS_PENDING);
+        self.set_worker_state(WorkerState::Paused, Some("range relinquished".to_string()));
+        self.clear_worker_range();
         self.log_msg(&format!(
             "range#{} relinquished at byte={} for scale-down",
             range.id,
@@ -323,6 +340,7 @@ impl ConnectionWorker {
     }
 
     pub(super) async fn run(self) -> Result<()> {
+        self.set_worker_state(WorkerState::Connecting, None);
         if self.h3_client.is_some() {
             self.run_live_h3().await
         } else if self.dry_run {
@@ -385,6 +403,7 @@ impl ConnectionWorker {
 
         loop {
             if self.control.is_halted() {
+                self.set_worker_state(WorkerState::Paused, Some("halt requested".to_string()));
                 break;
             }
 
@@ -396,6 +415,8 @@ impl ConnectionWorker {
             }
 
             if current_range.is_none() {
+                self.set_worker_state(WorkerState::WaitingForWork, None);
+                self.clear_worker_range();
                 if let Some(range) = prefetched_range.take() {
                     SchedulerMetrics::add(&self.metrics.prefetch_hits, 1);
                     current_range = Some(range.clone());
@@ -405,6 +426,8 @@ impl ConnectionWorker {
                     range_start_cursor = local_cursor;
                     current_range_id = Some(range.id);
                     consecutive_failures = 0;
+                    self.set_worker_state(WorkerState::Downloading, Some("prefetched".to_string()));
+                    self.set_worker_range(&range, local_cursor);
                     self.log_msg(&format!(
                         "range#{} assigned via prefetch wait_ms={} bytes={}..{} support={}..{}MB",
                         range.id,
@@ -424,6 +447,8 @@ impl ConnectionWorker {
                         range_start_cursor = local_cursor;
                         current_range_id = Some(range.id);
                         consecutive_failures = 0;
+                        self.set_worker_state(WorkerState::Downloading, None);
+                        self.set_worker_range(range, local_cursor);
                         self.log_msg(&format!(
                             "range#{} assigned wait_ms={} bytes={}..{} support={}..{}MB",
                             range.id,
@@ -435,8 +460,10 @@ impl ConnectionWorker {
                         ))
                         .await;
                     } else if no_more_work_hint {
+                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
                         break;
                     } else {
+                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
                         break;
                     }
                 }
@@ -455,6 +482,8 @@ impl ConnectionWorker {
                 current_range = None;
                 current_range_id = None;
                 consecutive_failures = 0;
+                self.set_worker_state(WorkerState::Finished, Some("range complete".to_string()));
+                self.clear_worker_range();
                 continue;
             }
 
@@ -474,6 +503,7 @@ impl ConnectionWorker {
                 Ok(res) => res,
                 Err(e) => {
                     let reason = format!("request error: {}", e);
+                    self.set_worker_state(WorkerState::Retrying, Some(reason.clone()));
                     let retry_hint = classify_error_retry(&reason, false);
                     consecutive_failures = self
                         .handle_range_retry(
@@ -497,6 +527,10 @@ impl ConnectionWorker {
             record_protocol_request_metric(&self.metrics, protocol_family);
 
             if !response.status().is_success() {
+                self.set_worker_state(
+                    WorkerState::Retrying,
+                    Some(format!("HTTP {}", response.status())),
+                );
                 if response.status().as_u16() == 429 {
                     self.origin_memory
                         .borrow_mut()
@@ -698,6 +732,9 @@ impl ConnectionWorker {
                 );
                 local_cursor = new_pos;
                 let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
+                self.worker_control.diagnostics.set_speed_bps(recent_speed_bps);
+                self.set_worker_state(WorkerState::Downloading, None);
+                self.set_worker_range(&range, local_cursor);
                 self.update_pending_write_target(&mut pending_write, recent_speed_bps);
                 if pending_write.data.len() >= pending_write.target_bytes {
                     self
@@ -760,6 +797,7 @@ impl ConnectionWorker {
                     if let Some(handle) = prefetch_handle {
                         handle.abort();
                     }
+                    self.set_worker_state(WorkerState::Paused, Some("scaled down".to_string()));
                     drop(write_tx);
                     let _ = writer_handle.await;
                     return Ok(());
@@ -774,6 +812,7 @@ impl ConnectionWorker {
                     consecutive_failures = 0;
                     range_wait_started = Instant::now();
                     self.reset_pending_write_target(&mut pending_write);
+                    self.clear_worker_range();
                     break;
                 }
             }
@@ -834,6 +873,8 @@ impl ConnectionWorker {
                 consecutive_failures = 0;
                 range_wait_started = Instant::now();
                 self.reset_pending_write_target(&mut pending_write);
+                self.set_worker_state(WorkerState::Finished, Some("range complete".to_string()));
+                self.clear_worker_range();
             } else if made_progress_this_attempt {
                 self
                     .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
@@ -854,6 +895,7 @@ impl ConnectionWorker {
             if let Some(handle) = prefetch_handle.take() {
                 handle.abort();
             }
+            self.set_worker_state(WorkerState::Paused, Some("halted".to_string()));
         }
 
         if !pending_write.data.is_empty() {
@@ -868,7 +910,12 @@ impl ConnectionWorker {
         drop(write_tx);
         if let Err(e) = writer_handle.await.unwrap_or(Ok(())) {
             self.log_msg(&format!("Writer task failed: {}", e)).await;
+            self.set_worker_state(WorkerState::Stopped, Some(e.to_string()));
             return Err(e);
+        }
+        if !self.control.is_halted() {
+            self.set_worker_state(WorkerState::Finished, Some("worker complete".to_string()));
+            self.clear_worker_range();
         }
         Ok(())
     }

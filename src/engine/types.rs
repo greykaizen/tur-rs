@@ -119,6 +119,32 @@ pub enum EngineEvent {
     Progress(Uuid, u64, f64),
     StatusChanged(Uuid, DownloadStatus),
     TotalSize(Uuid, u64),
+    Workers(Uuid, Vec<WorkerSnapshot>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    Connecting,
+    WaitingForWork,
+    Downloading,
+    Retrying,
+    Paused,
+    Stopped,
+    Finished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSnapshot {
+    pub connection_id: u32,
+    pub state: WorkerState,
+    pub transferred_bytes: u64,
+    pub speed_bps: f64,
+    pub range_start: Option<u64>,
+    pub range_end: Option<u64>,
+    pub range_cursor: Option<u64>,
+    pub detail: Option<String>,
 }
 
 pub enum EngineCommand {

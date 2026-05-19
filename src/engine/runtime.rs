@@ -65,15 +65,18 @@ pub(super) struct WorkerControl {
     pub stop_requested: Cell<bool>,
     pub transferred_bytes: Cell<u64>,
     pub pending_growth_probe: Cell<bool>,
+    pub diagnostics: Rc<WorkerDiagnosticsState>,
 }
 
 impl WorkerControl {
     pub(super) fn new(connection_id: u32) -> Rc<Self> {
+        let diagnostics = Rc::new(WorkerDiagnosticsState::new(connection_id));
         Rc::new(Self {
             connection_id,
             stop_requested: Cell::new(false),
             transferred_bytes: Cell::new(0),
             pending_growth_probe: Cell::new(false),
+            diagnostics,
         })
     }
 }
@@ -81,6 +84,74 @@ impl WorkerControl {
 pub(super) struct WorkerSlot {
     pub control: Rc<WorkerControl>,
     pub handle: JoinHandle<()>,
+}
+
+pub(super) struct WorkerDiagnosticsState {
+    connection_id: u32,
+    state: Cell<WorkerState>,
+    speed_bps: Cell<f64>,
+    range_start: Cell<u64>,
+    range_end: Cell<u64>,
+    range_cursor: Cell<u64>,
+    has_range: Cell<bool>,
+    detail: RefCell<Option<String>>,
+}
+
+impl WorkerDiagnosticsState {
+    fn new(connection_id: u32) -> Self {
+        Self {
+            connection_id,
+            state: Cell::new(WorkerState::Connecting),
+            speed_bps: Cell::new(0.0),
+            range_start: Cell::new(0),
+            range_end: Cell::new(0),
+            range_cursor: Cell::new(0),
+            has_range: Cell::new(false),
+            detail: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn set_state(&self, state: WorkerState) {
+        self.state.set(state);
+        if !matches!(state, WorkerState::Downloading) {
+            self.speed_bps.set(0.0);
+        }
+    }
+
+    pub(super) fn set_detail(&self, detail: Option<String>) {
+        *self.detail.borrow_mut() = detail;
+    }
+
+    pub(super) fn set_range(&self, start: u64, end: u64, cursor: u64) {
+        self.range_start.set(start);
+        self.range_end.set(end);
+        self.range_cursor.set(cursor);
+        self.has_range.set(true);
+    }
+
+    pub(super) fn clear_range(&self) {
+        self.has_range.set(false);
+        self.range_start.set(0);
+        self.range_end.set(0);
+        self.range_cursor.set(0);
+    }
+
+    pub(super) fn set_speed_bps(&self, speed_bps: f64) {
+        self.speed_bps.set(speed_bps.max(0.0));
+    }
+
+    pub(super) fn snapshot(&self, transferred_bytes: u64) -> WorkerSnapshot {
+        WorkerSnapshot {
+            connection_id: self.connection_id,
+            state: self.state.get(),
+            transferred_bytes,
+            speed_bps: self.speed_bps.get(),
+            range_start: self.has_range.get().then(|| self.range_start.get()),
+            range_end: self.has_range.get().then(|| self.range_end.get()),
+            range_cursor: self.has_range.get().then(|| self.range_cursor.get()),
+            detail: self.detail.borrow().clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]

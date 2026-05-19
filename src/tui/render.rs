@@ -6,6 +6,7 @@ use ratatui::{
 
 use super::app::TuiApp;
 use super::input::InputMode;
+use crate::engine::WorkerState;
 
 impl TuiApp {
     pub(super) fn draw(&self, f: &mut ratatui::Frame) {
@@ -15,6 +16,7 @@ impl TuiApp {
                 Constraint::Length(3),
                 Constraint::Min(0),
                 Constraint::Length(3),
+                Constraint::Length(if self.show_details { 10 } else { 3 }),
                 Constraint::Length(3),
             ])
             .split(f.area());
@@ -37,11 +39,17 @@ impl TuiApp {
                 };
                 let status = format!("{:?}", t.status);
                 let mode = if t.dry_run { "dry" } else { "live" };
+                let worker_count = self
+                    .worker_snapshots
+                    .get(&t.id)
+                    .map(|workers| workers.len())
+                    .unwrap_or(0);
                 ListItem::new(format!(
-                    "{:<20} | {:<12} | {:<4} | {:.2} MB/s",
+                    "{:<20} | {:<12} | {:<4} | {:>2} conn | {:.2} MB/s",
                     name,
                     status,
                     mode,
+                    worker_count,
                     t.speed / 1_000_000.0
                 ))
             })
@@ -76,10 +84,26 @@ impl TuiApp {
             f.render_widget(gauge, chunks[2]);
         }
 
+        // Worker details / summary
+        let detail_text = if self.show_details {
+            if let Some(i) = self.list_state.selected() {
+                let task = &self.tasks[i];
+                let workers = self.worker_snapshots.get(&task.id);
+                render_worker_details(task.id, workers)
+            } else {
+                "No task selected".to_string()
+            }
+        } else {
+            "Worker details hidden. Press [d] to expand.".to_string()
+        };
+        let details = Paragraph::new(detail_text)
+            .block(Block::default().title("Connections").borders(Borders::ALL));
+        f.render_widget(details, chunks[3]);
+
         // Input or Commands
         let help_text = match self.input_mode {
             InputMode::Normal => {
-                "[q]uit [n]ew [s]pause [r]resume [c]persist-stop ↑↓ move"
+                "[q]uit [n]ew [d]etails [s]pause [r]resume [c]persist-stop ↑↓ move"
             }
             InputMode::UrlInput => &format!("Enter URL: {}_", self.url_buffer),
             InputMode::DirInput => {
@@ -87,6 +111,60 @@ impl TuiApp {
             }
         };
         let help = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL));
-        f.render_widget(help, chunks[3]);
+        f.render_widget(help, chunks[4]);
     }
+}
+
+fn render_worker_details(
+    _task_id: uuid::Uuid,
+    workers: Option<&Vec<crate::engine::WorkerSnapshot>>,
+) -> String {
+    let Some(workers) = workers else {
+        return "No worker diagnostics yet.".to_string();
+    };
+    if workers.is_empty() {
+        return "No active worker snapshots.".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(workers.len() + 1);
+    lines.push("id  state            speed       bytes      range".to_string());
+    for worker in workers {
+        let state = match worker.state {
+            WorkerState::Connecting => "connecting",
+            WorkerState::WaitingForWork => "waiting",
+            WorkerState::Downloading => "downloading",
+            WorkerState::Retrying => "retrying",
+            WorkerState::Paused => "paused",
+            WorkerState::Stopped => "stopped",
+            WorkerState::Finished => "finished",
+        };
+        let speed = if worker.speed_bps > 0.0 {
+            format!("{:.2} MB/s", worker.speed_bps / 1_000_000.0)
+        } else {
+            "0.00 MB/s".to_string()
+        };
+        let bytes = format!("{:.1} MB", worker.transferred_bytes as f64 / (1024.0 * 1024.0));
+        let range = match (worker.range_start, worker.range_cursor, worker.range_end) {
+            (Some(start), Some(cursor), Some(end)) => {
+                format!(
+                    "{}..{} / {}",
+                    start / (1024 * 1024),
+                    cursor / (1024 * 1024),
+                    end / (1024 * 1024)
+                )
+            }
+            _ => "-".to_string(),
+        };
+        let mut line = format!(
+            "{:<3} {:<15} {:<10} {:<10} {}",
+            worker.connection_id, state, speed, bytes, range
+        );
+        if let Some(detail) = &worker.detail {
+            if !detail.is_empty() {
+                line.push_str(&format!(" ({detail})"));
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }

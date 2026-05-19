@@ -26,6 +26,9 @@
 //!             DownloadUpdate::TotalSize(size) => {
 //!                 println!("Total: {size} bytes");
 //!             }
+//!             DownloadUpdate::Workers(workers) => {
+//!                 println!("{} worker snapshots", workers.len());
+//!             }
 //!             DownloadUpdate::StatusChanged(status) => {
 //!                 println!("Status: {status:?}");
 //!                 if matches!(status, tur_rs::DownloadStatus::Completed) {
@@ -92,4 +95,4 @@ pub use service::{
 };
 pub use storage::StorageConfig;
 
-pub use engine::{DownloadStatus, HttpMode, ScheduleMode};
+pub use engine::{DownloadStatus, HttpMode, ScheduleMode, WorkerSnapshot, WorkerState};
