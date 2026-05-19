@@ -39,16 +39,27 @@ impl TuiApp {
                 };
                 let status = format!("{:?}", t.status);
                 let mode = if t.dry_run { "dry" } else { "live" };
+                let protocol_label = self
+                    .protocols
+                    .get(&t.id)
+                    .map(|p| match p {
+                        crate::engine::ProtocolFamily::Http1 => "h1",
+                        crate::engine::ProtocolFamily::Http2 => "h2",
+                        crate::engine::ProtocolFamily::Http3 => "h3",
+                        crate::engine::ProtocolFamily::Other => "auto",
+                    })
+                    .unwrap_or("auto");
                 let worker_count = self
                     .worker_snapshots
                     .get(&t.id)
                     .map(|workers| workers.len())
                     .unwrap_or(0);
                 ListItem::new(format!(
-                    "{:<20} | {:<12} | {:<4} | {:>2} conn | {:.2} MB/s",
+                    "{:<20} | {:<12} | {:<4} | {:<4} | {:>2} conn | {:.2} MB/s",
                     name,
                     status,
                     mode,
+                    protocol_label,
                     worker_count,
                     t.speed / 1_000_000.0
                 ))

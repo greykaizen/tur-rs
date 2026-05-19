@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::engine::{
-    DownloadTask, DownloadStatus, EngineCommand, EngineEvent, HttpMode, ScheduleMode,
+    DownloadTask, DownloadStatus, EngineCommand, EngineEvent, HttpMode, ProtocolFamily, ScheduleMode,
     WorkerSnapshot,
 };
 use crate::service::RequestContext;
@@ -28,6 +28,7 @@ use super::input::{FocusPane, InputMode};
 pub struct TuiApp {
     pub(super) tasks: Vec<DownloadTask>,
     pub(super) worker_snapshots: HashMap<Uuid, Vec<WorkerSnapshot>>,
+    pub(super) protocols: HashMap<Uuid, ProtocolFamily>,
     pub(super) list_state: ListState,
     pub(super) input_mode: InputMode,
     pub(super) focus_pane: FocusPane,
@@ -67,6 +68,7 @@ impl TuiApp {
         Self {
             tasks: Vec::new(),
             worker_snapshots: HashMap::new(),
+            protocols: HashMap::new(),
             list_state: ListState::default(),
             input_mode: InputMode::Normal,
             focus_pane: FocusPane::TaskList,
@@ -264,6 +266,9 @@ impl TuiApp {
             }
             EngineEvent::Workers(id, workers) => {
                 self.worker_snapshots.insert(id, workers);
+            }
+            EngineEvent::Protocol(id, protocol) => {
+                self.protocols.insert(id, protocol);
             }
         }
     }

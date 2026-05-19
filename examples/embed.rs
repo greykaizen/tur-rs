@@ -62,6 +62,9 @@ async fn run_service(url: &str, dir: &PathBuf) -> Result<()> {
             DownloadUpdate::Workers(workers) => {
                 println!("Workers: {}", workers.len());
             }
+            DownloadUpdate::Protocol(protocol) => {
+                println!("Protocol: {:?}", protocol);
+            }
             DownloadUpdate::Progress { downloaded_bytes, speed_bps } => {
                 println!(
                     "Progress: {} bytes @ {:.1} MiB/s",

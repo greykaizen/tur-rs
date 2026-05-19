@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::scaler::ProtocolFamily;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DownloadStatus {
@@ -120,6 +121,7 @@ pub enum EngineEvent {
     StatusChanged(Uuid, DownloadStatus),
     TotalSize(Uuid, u64),
     Workers(Uuid, Vec<WorkerSnapshot>),
+    Protocol(Uuid, ProtocolFamily),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

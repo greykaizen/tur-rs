@@ -80,6 +80,7 @@ mod types;
 mod worker;
 
 pub use runtime::DownloadEngine;
+pub use scaler::ProtocolFamily;
 pub use types::{
     ActiveRange, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HaltMode, HttpMode,
     ScheduleMode, WorkRequest, WorkerSnapshot, WorkerState,
@@ -244,7 +245,7 @@ impl ChallengeKind {
 use persistence::{ensure_parent_dir, load_snapshot, log_path, metadata_path, persist_snapshot, unix_time_ms};
 use ranges::{is_tail_phase_bytes, snapshot_downloaded};
 use runtime::{OriginPhiRatioStore, RuntimeControl, WorkerControl, WorkerSlot};
-use scaler::{ProtocolFamily, Scaler, ScalerAction, ScalerConfig, TokenBucket};
+use scaler::{Scaler, ScalerAction, ScalerConfig, TokenBucket};
 use worker::ConnectionWorker;
 
 async fn run_download_task(
@@ -1016,6 +1017,7 @@ async fn run_download_task_local(
     let progress_control = control.clone();
     let progress_total = total_size;
     let progress_handles = handles.clone();
+    let progress_scaler = scaler.clone();
     let progress_handle = tokio::task::spawn_local(async move {
         let mut last_downloaded = progress_counter.get();
         let mut last_tick = Instant::now();
@@ -1035,6 +1037,12 @@ async fn run_download_task_local(
 
             let _ = progress_tx
                 .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
+                .await;
+            let _ = progress_tx
+                .send(EngineEvent::Protocol(
+                    progress_task_id,
+                    progress_scaler.last_protocol.get(),
+                ))
                 .await;
             let worker_snapshots = {
                 let mut slots = progress_handles.borrow_mut();

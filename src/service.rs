@@ -530,6 +530,8 @@ pub enum DownloadUpdate {
     TotalSize(u64),
     /// Periodic worker/connection diagnostics.
     Workers(Vec<crate::engine::WorkerSnapshot>),
+    /// Current dominant protocol family observed for this task.
+    Protocol(crate::ProtocolFamily),
     /// Task status transition.
     StatusChanged(DownloadStatus),
 }
@@ -812,6 +814,9 @@ impl TurService {
                         }
                         EngineEvent::Workers(id, workers) => {
                             Some((id, DownloadUpdate::Workers(workers)))
+                        }
+                        EngineEvent::Protocol(id, protocol) => {
+                            Some((id, DownloadUpdate::Protocol(protocol)))
                         }
                         EngineEvent::StatusChanged(id, DownloadStatus::Completed) => {
                             let _ = handles.borrow_mut().remove(&id);

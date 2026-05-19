@@ -62,7 +62,7 @@ pub enum ScalerAction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub(crate) enum ProtocolFamily {
+pub enum ProtocolFamily {
     Http1,
     Http2,
     Http3,
