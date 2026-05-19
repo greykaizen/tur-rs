@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,12 @@ fn run_local_test<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = TEST_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("serialize service control smoke tests");
+
     #[cfg(feature = "http3")]
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 

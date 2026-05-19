@@ -592,9 +592,19 @@ async fn run_download_task_local(
                 break;
             }
 
-            scaler_handles
-                .borrow_mut()
-                .retain(|slot| !slot.handle.is_finished());
+            let live_worker_count = {
+                let mut slots = scaler_handles.borrow_mut();
+                slots.retain(|slot| !slot.handle.is_finished());
+                slots.len()
+            };
+            let leased = scaler_leased_connections.get();
+            if leased > live_worker_count {
+                for _ in 0..(leased - live_worker_count) {
+                    scaler_engine.release_connection();
+                }
+                scaler_leased_connections.set(live_worker_count);
+            }
+            scaler_for_task.n_active.set(live_worker_count);
 
             let current_downloaded = scaler_global_downloaded.get();
             let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
@@ -740,7 +750,9 @@ async fn run_download_task_local(
             .await;
 
             if n_active == 0 {
-                if scaler_engine.request_connection() {
+                let recover_target = min_c.max(1);
+                let mut recovered = 0usize;
+                while recovered < recover_target && scaler_engine.request_connection() {
                     let worker_control = WorkerControl::new(connection_id_counter);
                     worker_control.pending_growth_probe.set(true);
                     let worker = ConnectionWorker {
@@ -778,24 +790,28 @@ async fn run_download_task_local(
                         control: worker_control,
                         handle,
                     });
-                    scaler_for_task.n_active.set(1);
+                    recovered += 1;
                     scaler_leased_connections.set(scaler_leased_connections.get() + 1);
-                    scaler_for_task.last_action.set(ScalerAction::Grow);
-                    scaler_for_task
-                        .slow_start_remaining
-                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, false));
                     record_protocol_scale_metric(
                         &scaler_metrics,
                         dominant_protocol,
                         ScalerAction::Grow,
                         false,
                     );
-                    record_max_active_connections(&scaler_metrics, 1);
+                }
+                if recovered > 0 {
+                    scaler_for_task.n_active.set(recovered);
+                    scaler_for_task.last_action.set(ScalerAction::Grow);
+                    scaler_for_task
+                        .slow_start_remaining
+                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, false));
+                    record_max_active_connections(&scaler_metrics, recovered);
                     log_phase_a_info(
                         &scaler_log_path,
                         &format!(
-                            "scale_recover connection_id={} n_active=1 slow_start_remaining={}",
-                            connection_id_counter - 1,
+                            "scale_recover recovered={} target={} slow_start_remaining={}",
+                            recovered,
+                            recover_target,
                             scaler_for_task.slow_start_remaining.get(),
                         ),
                     )
