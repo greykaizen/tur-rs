@@ -1,7 +1,5 @@
 use super::*;
-use crate::engine::coordinator::{
-    CoordinatorSnapshot, DlRangeSnapshot, RANGE_STATUS_ACTIVE,
-};
+use crate::engine::coordinator::{CoordinatorSnapshot, DlRangeSnapshot, RANGE_STATUS_ACTIVE};
 use crate::engine::http::compute_http2_client_tuning;
 use crate::engine::http::{extract_origin, strip_sensitive_headers};
 
@@ -24,8 +22,14 @@ fn connection_cv_requires_meaningful_samples() {
 
 #[test]
 fn origin_key_normalizes_scheme_host_and_port() {
-    assert_eq!(origin_key("https://example.com/path"), "https://example.com:443");
-    assert_eq!(origin_key("http://example.com/test"), "http://example.com:80");
+    assert_eq!(
+        origin_key("https://example.com/path"),
+        "https://example.com:443"
+    );
+    assert_eq!(
+        origin_key("http://example.com/test"),
+        "http://example.com:80"
+    );
     assert_eq!(origin_key("not a url"), "not a url");
 }
 
@@ -60,6 +64,28 @@ fn protocol_thresholds_are_directionally_sensible() {
 }
 
 #[test]
+fn resume_prior_policy_uses_age_buckets() {
+    let fresh = compute_resume_prior_policy(1_000, 31_000);
+    assert_eq!(fresh.kind, ResumePriorKind::Fresh);
+    assert_eq!(fresh.weight, 1.0);
+
+    let decayed = compute_resume_prior_policy(1_000, 91_000);
+    assert_eq!(decayed.kind, ResumePriorKind::Decayed);
+    assert_eq!(decayed.weight, 0.5);
+
+    let stale = compute_resume_prior_policy(1_000, 400_001);
+    assert_eq!(stale.kind, ResumePriorKind::Stale);
+    assert_eq!(stale.weight, 0.0);
+}
+
+#[test]
+fn blend_resume_prior_respects_weight() {
+    assert_eq!(blend_resume_prior(10.0, 100.0, 0.0), 10.0);
+    assert_eq!(blend_resume_prior(10.0, 100.0, 1.0), 100.0);
+    assert_eq!(blend_resume_prior(10.0, 100.0, 0.5), 55.0);
+}
+
+#[test]
 fn http2_client_tuning_scales_with_expected_concurrency() {
     let small = compute_http2_client_tuning(2);
     let large = compute_http2_client_tuning(16);
@@ -74,7 +100,10 @@ fn learned_http2_tuning_is_origin_scoped_and_pruned() {
     let tuning = learn_http2_client_tuning(4, 3, 120.0, 12.0 * MB as f64);
     store.update_origin_tuning("https://example.com:443".to_string(), tuning);
     assert_eq!(
-        store.current_tuning("https://example.com:443").unwrap().source,
+        store
+            .current_tuning("https://example.com:443")
+            .unwrap()
+            .source,
         H2TuningSource::LearnedOrigin
     );
 
@@ -120,9 +149,15 @@ fn strip_sensitive_headers_removes_auth_cookie_referer() {
 
     let mut headers = HeaderMap::new();
     headers.insert("x-custom", "keep".parse().unwrap());
-    headers.insert(::http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    headers.insert(
+        ::http::header::AUTHORIZATION,
+        "Bearer token".parse().unwrap(),
+    );
     headers.insert(::http::header::COOKIE, "session=abc".parse().unwrap());
-    headers.insert(::http::header::REFERER, "https://origin.com".parse().unwrap());
+    headers.insert(
+        ::http::header::REFERER,
+        "https://origin.com".parse().unwrap(),
+    );
     headers.insert(::http::header::ACCEPT, "text/html".parse().unwrap());
 
     let safe = strip_sensitive_headers(&headers);
@@ -170,8 +205,14 @@ fn classify_response_body_returns_unexpected_html_for_unknown_html() {
 #[test]
 fn cookie_jar_match_url_filters_by_domain_path_and_secure() {
     let mut jar = crate::service::CookieJar::new();
-    jar.insert(crate::service::CookieEntry::new("session", "abc", "example.com"));
-    jar.insert(crate::service::CookieEntry::new("tracking", "xyz", "ads.com"));
+    jar.insert(crate::service::CookieEntry::new(
+        "session",
+        "abc",
+        "example.com",
+    ));
+    jar.insert(crate::service::CookieEntry::new(
+        "tracking", "xyz", "ads.com",
+    ));
 
     let url = url::Url::parse("https://example.com/page").unwrap();
     let matched = jar.match_url(&url);
@@ -208,7 +249,7 @@ fn challenge_requires_browser_session_returns_false_for_non_aborting_types() {
 
 #[test]
 fn service_cookie_jar_merges_into_request_context_with_dedup() {
-    use crate::service::{CookieJar, CookieEntry, RequestContext};
+    use crate::service::{CookieEntry, CookieJar, RequestContext};
     use url::Url;
 
     // Setup: service cookie jar with cookies for example.com
@@ -230,7 +271,10 @@ fn service_cookie_jar_merges_into_request_context_with_dedup() {
 
     let mut existing = ctx.cookies.take().unwrap_or_default();
     for c in jar_cookies {
-        if !existing.iter().any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path) {
+        if !existing
+            .iter()
+            .any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path)
+        {
             existing.push(c);
         }
     }
@@ -238,7 +282,11 @@ fn service_cookie_jar_merges_into_request_context_with_dedup() {
 
     // Verify: 3 cookies total (custom, session(override), tracking)
     let cookies = ctx.cookies.as_ref().unwrap();
-    assert_eq!(cookies.len(), 3, "should have custom + session(override) + tracking");
+    assert_eq!(
+        cookies.len(),
+        3,
+        "should have custom + session(override) + tracking"
+    );
 
     // Verify per-request "session" override was NOT shadowed by jar's "session"
     let session = cookies.iter().find(|c| c.name == "session").unwrap();
@@ -248,10 +296,16 @@ fn service_cookie_jar_merges_into_request_context_with_dedup() {
     );
 
     // Verify tracking cookie from jar was merged in
-    assert!(cookies.iter().any(|c| c.name == "tracking"), "jar tracking cookie should be present");
+    assert!(
+        cookies.iter().any(|c| c.name == "tracking"),
+        "jar tracking cookie should be present"
+    );
 
     // Verify custom cookie from per-request context is preserved
-    assert!(cookies.iter().any(|c| c.name == "custom"), "per-request custom cookie should be present");
+    assert!(
+        cookies.iter().any(|c| c.name == "custom"),
+        "per-request custom cookie should be present"
+    );
 }
 
 #[test]
@@ -299,10 +353,8 @@ fn coordinator_resume_clears_dead_assignments_and_active_status() {
         index_state_bits: vec![0],
     };
 
-    let log_path = std::env::temp_dir().join(format!(
-        "tur-coordinator-resume-{}.log",
-        std::process::id()
-    ));
+    let log_path =
+        std::env::temp_dir().join(format!("tur-coordinator-resume-{}.log", std::process::id()));
     let metrics = Rc::new(SchedulerMetrics::default());
     let adaptive_minimum_steal_bytes = Rc::new(Cell::new(2 * STORAGE_BLOCK_SIZE));
 

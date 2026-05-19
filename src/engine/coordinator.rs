@@ -80,6 +80,8 @@ pub struct ResumeBootstrap {
     pub(super) peak_efficiency_bps: f64,
     pub(super) reuse_rate: f64,
     pub(super) heartbeat_ms: u64,
+    #[serde(default)]
+    pub(super) saved_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -107,7 +109,10 @@ impl IndexStateMap {
         let bucket_count = total_size.div_ceil(INDEX_STATE_BYTES) as usize;
         let mut buckets = Vec::with_capacity(bucket_count);
         buckets.resize_with(bucket_count, || Cell::new(0));
-        Self { total_size, buckets }
+        Self {
+            total_size,
+            buckets,
+        }
     }
 
     pub(super) fn from_snapshot(total_size: u64, bits: Vec<u8>) -> Self {
@@ -117,14 +122,14 @@ impl IndexStateMap {
             let value = bits.get(idx).copied().unwrap_or(0);
             buckets.push(Cell::new(value));
         }
-        Self { total_size, buckets }
+        Self {
+            total_size,
+            buckets,
+        }
     }
 
     pub(super) fn snapshot_bits(&self) -> Vec<u8> {
-        self.buckets
-            .iter()
-            .map(|bucket| bucket.get())
-            .collect()
+        self.buckets.iter().map(|bucket| bucket.get()).collect()
     }
 
     pub(super) fn bucket_count(&self) -> usize {
@@ -175,7 +180,6 @@ impl IndexStateMap {
     }
 }
 
-
 impl Coordinator {
     pub(super) fn new(
         task_id: Uuid,
@@ -197,11 +201,15 @@ impl Coordinator {
             .ok_or_else(|| anyhow!("Download exceeds generated Fibonacci range table"))?;
 
         let seed_ranges = match schedule_mode {
-            ScheduleMode::FibAdaptive => {
-                build_phi_geometric_ranges(total_size, connections.max(1), phi_max_ratio, STORAGE_BLOCK_SIZE)
-            }
+            ScheduleMode::FibAdaptive => build_phi_geometric_ranges(
+                total_size,
+                connections.max(1),
+                phi_max_ratio,
+                STORAGE_BLOCK_SIZE,
+            ),
             ScheduleMode::Fib => {
-                let seed_start_idx = choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
+                let seed_start_idx =
+                    choose_seed_start_idx(&fib_mb, support_idx, connections.max(1), dry_run);
                 build_seed_ranges(&fib_mb, seed_start_idx, support_idx, total_size)
             }
             ScheduleMode::Equal => build_equal_ranges(total_size, connections.max(1)),
@@ -266,20 +274,23 @@ impl Coordinator {
             coordinator.index_state.bucket_count(),
             coordinator.index_state.storage_bytes(),
         ));
-        coordinator.log(&format!("Initial distribution geometry: [{}]", geometry_label));
+        coordinator.log(&format!(
+            "Initial distribution geometry: [{}]",
+            geometry_label
+        ));
         let range_lines: Vec<String> = seed_ranges
             .iter()
             .map(|spec| {
                 let fit_end_mb = bytes_to_ceiling_mb(spec.byte_end);
                 format!(
-                "vector range#{} support={}..{}MB fit_end={}MB bytes={}..{}",
-                spec.id,
-                spec.label_start_mb,
-                spec.label_end_mb,
-                fit_end_mb,
-                spec.byte_start,
-                spec.byte_end
-            )
+                    "vector range#{} support={}..{}MB fit_end={}MB bytes={}..{}",
+                    spec.id,
+                    spec.label_start_mb,
+                    spec.label_end_mb,
+                    fit_end_mb,
+                    spec.byte_start,
+                    spec.byte_end
+                )
             })
             .collect();
         for line in range_lines {
@@ -340,7 +351,10 @@ impl Coordinator {
             borrow_cursor: snapshot.borrow_cursor,
             next_range_id: snapshot.next_range_id,
             total_size,
-            index_state: Rc::new(IndexStateMap::from_snapshot(total_size, snapshot.index_state_bits)),
+            index_state: Rc::new(IndexStateMap::from_snapshot(
+                total_size,
+                snapshot.index_state_bits,
+            )),
             log_file: std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -379,7 +393,11 @@ impl Coordinator {
         ));
     }
 
-    pub(super) async fn run(&mut self, mut work_rx: mpsc::Receiver<WorkRequest>, control: Rc<RuntimeControl>) {
+    pub(super) async fn run(
+        &mut self,
+        mut work_rx: mpsc::Receiver<WorkRequest>,
+        control: Rc<RuntimeControl>,
+    ) {
         while let Some(req) = work_rx.recv().await {
             if control.is_halted() {
                 let _ = req.tx.send(None);

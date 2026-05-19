@@ -1,31 +1,31 @@
-use std::collections::{HashMap, HashSet};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::fs::File as StdFile;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::File as StdFile;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
-use bytes::Bytes;
 use ::http::header::{
     ACCEPT, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     LOCATION, RANGE, USER_AGENT,
 };
 use ::http::{Method, Request, Uri, Version};
+use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde::{Deserialize, Serialize};
+use sysinfo::System;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use sysinfo::System;
 use url::Url;
 use uuid::Uuid;
 
@@ -59,10 +59,11 @@ const GOLDEN_RATIO_NUM: u64 = 633;
 const GOLDEN_RATIO_DEN: u64 = 1024;
 const MAX_REDIRECTS: usize = 8;
 const USER_AGENT_VALUE: &str = concat!("tur/", env!("CARGO_PKG_VERSION"));
+const RESUME_PRIOR_FRESH_MAX_AGE_MS: u64 = 60_000;
+const RESUME_PRIOR_DECAY_MAX_AGE_MS: u64 = 5 * 60_000;
 
 type DownloadHttpClient =
     HyperClient<HttpsConnector<crate::connector::TunedConnector>, Empty<Bytes>>;
-
 
 mod coordinator;
 mod helpers;
@@ -87,28 +88,24 @@ pub use types::{
 };
 
 use coordinator::{
-    Coordinator, IndexStateMap, ResumeBootstrap, TaskSnapshot, INITIAL_PHI_MAX_RATIO,
-    RANGE_STATUS_FINISHED, RANGE_STATUS_PENDING, STORAGE_BLOCK_SIZE, UNASSIGNED_CONNECTION,
+    Coordinator, INITIAL_PHI_MAX_RATIO, IndexStateMap, RANGE_STATUS_FINISHED, RANGE_STATUS_PENDING,
+    ResumeBootstrap, STORAGE_BLOCK_SIZE, TaskSnapshot, UNASSIGNED_CONNECTION,
 };
 use http::{
     align_down, build_http_client, bytes_to_ceiling_mb, bytes_to_floor_mb,
-    compute_protocol_aware_steal_floor_bytes,
-    dominant_protocol_from_metrics, http_version_label, learn_http2_client_tuning,    protocol_family_for_version,
-    protocol_growth_shield_min_samples, protocol_growth_shield_multiplier,
-    record_max_active_connections, record_protocol_request_metric,
-    record_protocol_scale_metric, send_request_follow_redirects,
+    compute_protocol_aware_steal_floor_bytes, dominant_protocol_from_metrics, http_version_label,
+    learn_http2_client_tuning, protocol_family_for_version, protocol_growth_shield_min_samples,
+    protocol_growth_shield_multiplier, record_max_active_connections,
+    record_protocol_request_metric, record_protocol_scale_metric, send_request_follow_redirects,
 };
 use metrics::SchedulerMetrics;
 
 // Used only by the tests module
 #[cfg(test)]
-use http::{
-    protocol_effective_add_threshold,
-    protocol_prefetch_handshake_ms,
-};
+use http::{protocol_effective_add_threshold, protocol_prefetch_handshake_ms};
 use origin_memory::{
-    origin_key, ClientTuning, H2TuningSource, OriginH2TuningStore, OriginMemoryStore,
-    SessionRequirementField,
+    ClientTuning, H2TuningSource, OriginH2TuningStore, OriginMemoryStore, SessionRequirementField,
+    origin_key,
 };
 
 /// Build an `http::HeaderMap` from a `DownloadTask`'s request context.
@@ -162,7 +159,72 @@ fn build_request_headers(task: &DownloadTask) -> Option<::http::HeaderMap> {
         }
     }
 
-    if headers.is_empty() { None } else { Some(headers) }
+    if headers.is_empty() {
+        None
+    } else {
+        Some(headers)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResumePriorKind {
+    Fresh,
+    Decayed,
+    Stale,
+}
+
+impl ResumePriorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Decayed => "decayed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResumePriorPolicy {
+    age_ms: u64,
+    weight: f64,
+    kind: ResumePriorKind,
+}
+
+fn compute_resume_prior_policy(saved_at_ms: u64, now_ms: u64) -> ResumePriorPolicy {
+    let age_ms = if saved_at_ms == 0 {
+        u64::MAX
+    } else {
+        now_ms.saturating_sub(saved_at_ms)
+    };
+    if age_ms <= RESUME_PRIOR_FRESH_MAX_AGE_MS {
+        ResumePriorPolicy {
+            age_ms,
+            weight: 1.0,
+            kind: ResumePriorKind::Fresh,
+        }
+    } else if age_ms <= RESUME_PRIOR_DECAY_MAX_AGE_MS {
+        ResumePriorPolicy {
+            age_ms,
+            weight: 0.5,
+            kind: ResumePriorKind::Decayed,
+        }
+    } else {
+        ResumePriorPolicy {
+            age_ms,
+            weight: 0.0,
+            kind: ResumePriorKind::Stale,
+        }
+    }
+}
+
+fn blend_resume_prior(current: f64, saved: f64, weight: f64) -> f64 {
+    if weight <= 0.0 {
+        current
+    } else if weight >= 1.0 {
+        saved
+    } else {
+        (saved * weight) + (current * (1.0 - weight))
+    }
 }
 
 /// Detect whether a response body indicates a challenge/interstitial page
@@ -203,8 +265,10 @@ pub(super) fn classify_response_body(body_bytes: &[u8]) -> Option<ChallengeKind>
     }
 
     // Generic interstitial (login wall, terms page, etc.)
-    if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate")
-        && (lower.contains("continue") || lower.contains("proceed"))
+    if lower.contains("sign in")
+        || lower.contains("log in")
+        || lower.contains("authenticate")
+            && (lower.contains("continue") || lower.contains("proceed"))
     {
         return Some(ChallengeKind::AuthInterstitial);
     }
@@ -242,7 +306,9 @@ impl ChallengeKind {
         )
     }
 }
-use persistence::{ensure_parent_dir, load_snapshot, log_path, metadata_path, persist_snapshot, unix_time_ms};
+use persistence::{
+    ensure_parent_dir, load_snapshot, log_path, metadata_path, persist_snapshot, unix_time_ms,
+};
 use ranges::{is_tail_phase_bytes, snapshot_downloaded};
 use runtime::{OriginPhiRatioStore, RuntimeControl, WorkerControl, WorkerSlot};
 use scaler::{Scaler, ScalerAction, ScalerConfig, TokenBucket};
@@ -267,7 +333,8 @@ async fn run_download_task(
         cmd_tx,
         event_tx,
         default_connections,
-    ).await
+    )
+    .await
 }
 
 async fn run_download_task_local(
@@ -297,7 +364,17 @@ async fn run_download_task_local(
         .as_ref()
         .map(|snapshot| snapshot.resume_state.clone())
         .unwrap_or_default();
-    let protocol_hint = if is_resume && !matches!(resume_state.protocol_hint, ProtocolFamily::Other) {
+    let resume_prior_policy = if is_resume {
+        compute_resume_prior_policy(resume_state.saved_at_ms, unix_time_ms())
+    } else {
+        ResumePriorPolicy {
+            age_ms: 0,
+            weight: 0.0,
+            kind: ResumePriorKind::Stale,
+        }
+    };
+    let protocol_hint = if is_resume && !matches!(resume_state.protocol_hint, ProtocolFamily::Other)
+    {
         resume_state.protocol_hint
     } else {
         engine
@@ -306,7 +383,10 @@ async fn run_download_task_local(
             .protocol_hint_for_origin(&origin)
             .unwrap_or(ProtocolFamily::Other)
     };
-    let phi_max_ratio = engine.origin_phi_ratios.borrow_mut().ratio_for_origin(&origin);
+    let phi_max_ratio = engine
+        .origin_phi_ratios
+        .borrow_mut()
+        .ratio_for_origin(&origin);
     let origin_memory_hit = engine.origin_memory.borrow().memory_hit_for_origin(&origin);
     let shared_write_latency_ms = Rc::new(Cell::new(10.0));
     let write_buffer_cap_bytes = engine.write_buffer_cap_bytes.clone();
@@ -352,8 +432,13 @@ async fn run_download_task_local(
             cnt
         };
         let head_extra_headers = build_request_headers(&task);
-        let head_fut =
-            send_request_follow_redirects(&head_client, Method::HEAD, &head_url, None, head_extra_headers.as_ref());
+        let head_fut = send_request_follow_redirects(
+            &head_client,
+            Method::HEAD,
+            &head_url,
+            None,
+            head_extra_headers.as_ref(),
+        );
         tokio::pin!(head_fut);
         tokio::pin!(conn_fut);
 
@@ -383,16 +468,26 @@ async fn run_download_task_local(
         }
 
         if !task.dry_run {
-            engine.origin_memory.borrow_mut().note_content_length_reliable(&origin, size > 0);
+            engine
+                .origin_memory
+                .borrow_mut()
+                .note_content_length_reliable(&origin, size > 0);
             // Phase 3c: Parse Alt-Svc from HEAD response for H3 upgrade hint
             if let Some(h3_port) = crate::quic::parse_alt_svc_h3_port(res.headers()) {
-                engine.origin_memory.borrow_mut().note_protocol(&origin, ProtocolFamily::Http3);
+                engine
+                    .origin_memory
+                    .borrow_mut()
+                    .note_protocol(&origin, ProtocolFamily::Http3);
                 if let Ok(mut log_file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&log_path)
                 {
-                    let _ = writeln!(log_file, "alt_svc_h3_cached origin={} port={}", origin, h3_port);
+                    let _ = writeln!(
+                        log_file,
+                        "alt_svc_h3_cached origin={} port={}",
+                        origin, h3_port
+                    );
                 }
             }
         }
@@ -401,9 +496,14 @@ async fn run_download_task_local(
     };
 
     task.total_size = total_size;
-    let _ = event_tx.send(EngineEvent::TotalSize(task.id, total_size)).await;
     let _ = event_tx
-        .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Downloading))
+        .send(EngineEvent::TotalSize(task.id, total_size))
+        .await;
+    let _ = event_tx
+        .send(EngineEvent::StatusChanged(
+            task.id,
+            DownloadStatus::Downloading,
+        ))
         .await;
     let mut coordinator = if let Some(snapshot) = snapshot {
         Coordinator::from_snapshot(
@@ -458,7 +558,10 @@ async fn run_download_task_local(
     task.connections = task.connections.clamp(min_connections, max_connections);
     desired_initial_connections = task.connections.max(1);
     let (work_tx, work_rx) = mpsc::channel(128);
-    let learned_h2_tuning = engine.origin_h2_tunings.borrow_mut().tuning_for_origin(&origin);
+    let learned_h2_tuning = engine
+        .origin_h2_tunings
+        .borrow_mut()
+        .tuning_for_origin(&origin);
     let (http_client, client_tuning) =
         build_http_client(task.http_mode, max_connections, learned_h2_tuning);
 
@@ -499,12 +602,27 @@ async fn run_download_task_local(
     scaler.last_protocol.set(protocol_hint);
     if is_resume {
         if resume_state.ewma_throughput_bps > 0.0 {
-            scaler.ewma_throughput.set(resume_state.ewma_throughput_bps);
+            scaler.ewma_throughput.set(blend_resume_prior(
+                scaler.ewma_throughput.get(),
+                resume_state.ewma_throughput_bps,
+                resume_prior_policy.weight,
+            ));
         }
         if resume_state.peak_efficiency_bps > 0.0 {
-            scaler.peak_efficiency.set(resume_state.peak_efficiency_bps);
+            scaler.peak_efficiency.set(blend_resume_prior(
+                scaler.peak_efficiency.get(),
+                resume_state.peak_efficiency_bps,
+                resume_prior_policy.weight,
+            ));
         }
-        scaler.reuse_rate.set(resume_state.reuse_rate.clamp(0.0, 1.0));
+        scaler.reuse_rate.set(
+            blend_resume_prior(
+                scaler.reuse_rate.get(),
+                resume_state.reuse_rate.clamp(0.0, 1.0),
+                resume_prior_policy.weight,
+            )
+            .clamp(0.0, 1.0),
+        );
         scaler.slow_start_remaining.set(1);
         scaler.last_action.set(ScalerAction::Hold);
     }
@@ -550,18 +668,21 @@ async fn run_download_task_local(
         log_phase_a_info(
             &log_path,
             &format!(
-                "resume_bootstrap target_connections={} initial_connections={} protocol_hint={} ewma_throughput_bps={:.0} reuse_rate={:.2} heartbeat_ms={}",
+                "resume_bootstrap target_connections={} initial_connections={} protocol_hint={} ewma_throughput_bps={:.0} reuse_rate={:.2} heartbeat_ms={} prior_age_ms={} prior_weight={:.2} prior_kind={}",
                 task.connections,
                 initial_connections,
                 protocol_hint.as_str(),
                 scaler.ewma_throughput.get(),
                 scaler.reuse_rate.get(),
                 control.scaler_config().borrow().heartbeat_ms,
+                resume_prior_policy.age_ms,
+                resume_prior_policy.weight,
+                resume_prior_policy.kind.as_str(),
             ),
         )
         .await;
     }
-        for connection_id in 0..initial_connections {
+    for connection_id in 0..initial_connections {
         let worker_control = WorkerControl::new(connection_id as u32);
         worker_control.pending_growth_probe.set(false);
         let worker = ConnectionWorker {
@@ -626,7 +747,7 @@ async fn run_download_task_local(
     let scaler_task = tokio::task::spawn_local(async move {
         let mut last_downloaded = scaler_global_downloaded.get();
         let mut heartbeat_ms_for_tick = scaler_for_task.config.borrow().heartbeat_ms.max(500);
-        
+
         loop {
             tokio::time::sleep(Duration::from_millis(heartbeat_ms_for_tick)).await;
             if scaler_control.is_halted() || scaler_global_downloaded.get() >= total_size {
@@ -669,8 +790,10 @@ async fn run_download_task_local(
                 scaler_for_task.ewma_throughput.set(updated);
                 updated
             };
-            let dominant_protocol =
-                dominant_protocol_from_metrics(&scaler_metrics, scaler_for_task.last_protocol.get());
+            let dominant_protocol = dominant_protocol_from_metrics(
+                &scaler_metrics,
+                scaler_for_task.last_protocol.get(),
+            );
             let next_heartbeat_ms = compute_heartbeat_ms(&scaler_for_task);
             scaler_for_task.config.borrow_mut().heartbeat_ms = next_heartbeat_ms;
             heartbeat_ms_for_tick = next_heartbeat_ms;
@@ -725,7 +848,8 @@ async fn run_download_task_local(
                         .copied()
                         .unwrap_or((current_total, 0));
                     let current_delta = current_total.saturating_sub(prev_total);
-                    worker_history.insert(slot.control.connection_id, (current_total, current_delta));
+                    worker_history
+                        .insert(slot.control.connection_id, (current_total, current_delta));
                     let score = prev_delta.saturating_add(current_delta);
                     if current_delta > 0 {
                         connection_speeds.push(current_delta as f64 / interval_secs);
@@ -845,7 +969,11 @@ async fn run_download_task_local(
                     scaler_for_task.last_action.set(ScalerAction::Grow);
                     scaler_for_task
                         .slow_start_remaining
-                        .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, false));
+                        .set(compute_slow_start_heartbeats(
+                            &scaler_for_task,
+                            dominant_protocol,
+                            false,
+                        ));
                     record_max_active_connections(&scaler_metrics, recovered);
                     log_phase_a_info(
                         &scaler_log_path,
@@ -875,26 +1003,30 @@ async fn run_download_task_local(
                         scaler_for_task.last_action.set(ScalerAction::Hold);
                     }
                 }
-            } else if current_efficiency < 0.85 * scaler_for_task.peak_efficiency.get() && n_active > min_c {
+            } else if current_efficiency < 0.85 * scaler_for_task.peak_efficiency.get()
+                && n_active > min_c
+            {
                 drop_connection_id = weakest_connection;
             } else if n_active < max_c && !scaler_for_task.h2_stream_saturated.get() {
                 if scaler_engine.request_connection() {
                     scaler_for_task.throughput_before_add.set(new_ewma);
                     did_add = true;
-                let is_stream_add = dominant_protocol == ProtocolFamily::Http2
-                    && scaler_for_task.reuse_rate.get() > 0.70
-                    && scaler_for_task.reused_rtt_samples.get() >= 2;
-                scaler_for_task.last_add_was_stream.set(is_stream_add);
-                if is_stream_add {
-                    scaler_for_task.h2_stream_count.set(scaler_for_task.h2_stream_count.get() + 1);
-                }
-                // H2 stream saturation detection: if we've added 3+ stream workers
-                // recently without throughput improvement, flag as saturated
-                if is_stream_add && scaler_for_task.h2_stream_count.get() >= 3 {
-                    let prev_throughput = scaler_for_task.throughput_before_add.get();
-                    if prev_throughput > 0.0 && new_ewma < prev_throughput * 1.05 {
-                        if !scaler_for_task.h2_stream_saturated.get() {
-                            log_phase_a_info(
+                    let is_stream_add = dominant_protocol == ProtocolFamily::Http2
+                        && scaler_for_task.reuse_rate.get() > 0.70
+                        && scaler_for_task.reused_rtt_samples.get() >= 2;
+                    scaler_for_task.last_add_was_stream.set(is_stream_add);
+                    if is_stream_add {
+                        scaler_for_task
+                            .h2_stream_count
+                            .set(scaler_for_task.h2_stream_count.get() + 1);
+                    }
+                    // H2 stream saturation detection: if we've added 3+ stream workers
+                    // recently without throughput improvement, flag as saturated
+                    if is_stream_add && scaler_for_task.h2_stream_count.get() >= 3 {
+                        let prev_throughput = scaler_for_task.throughput_before_add.get();
+                        if prev_throughput > 0.0 && new_ewma < prev_throughput * 1.05 {
+                            if !scaler_for_task.h2_stream_saturated.get() {
+                                log_phase_a_info(
                                 &scaler_log_path,
                                 &format!(
                                     "h2_stream_saturation_detected stream_count={} throughput_bps={:.0} prev_throughput_bps={:.0}",
@@ -903,25 +1035,29 @@ async fn run_download_task_local(
                                     prev_throughput,
                                 ),
                             ).await;
-                            scaler_for_task.h2_stream_saturated.set(true);
-                            SchedulerMetrics::add(&scaler_metrics.h2_stream_saturated_count, 1);
+                                scaler_for_task.h2_stream_saturated.set(true);
+                                SchedulerMetrics::add(&scaler_metrics.h2_stream_saturated_count, 1);
+                            }
+                        } else {
+                            // Throughput improved — not saturated
+                            scaler_for_task.h2_stream_saturated.set(false);
                         }
-                    } else {
-                        // Throughput improved — not saturated
-                        scaler_for_task.h2_stream_saturated.set(false);
                     }
-                }
-                scaler_for_task
-                    .slow_start_remaining
-                    .set(compute_slow_start_heartbeats(&scaler_for_task, dominant_protocol, is_stream_add));
-                scaler_for_task.last_action.set(ScalerAction::Grow);
-                scaler_leased_connections.set(scaler_leased_connections.get() + 1);
-                record_protocol_scale_metric(
-                    &scaler_metrics,
-                    dominant_protocol,
-                    ScalerAction::Grow,
-                    is_stream_add,
-                );
+                    scaler_for_task
+                        .slow_start_remaining
+                        .set(compute_slow_start_heartbeats(
+                            &scaler_for_task,
+                            dominant_protocol,
+                            is_stream_add,
+                        ));
+                    scaler_for_task.last_action.set(ScalerAction::Grow);
+                    scaler_leased_connections.set(scaler_leased_connections.get() + 1);
+                    record_protocol_scale_metric(
+                        &scaler_metrics,
+                        dominant_protocol,
+                        ScalerAction::Grow,
+                        is_stream_add,
+                    );
                     record_max_active_connections(&scaler_metrics, n_active + 1);
                 }
             }
@@ -929,7 +1065,9 @@ async fn run_download_task_local(
             if let Some(connection_id) = drop_connection_id {
                 let mut dropped = false;
                 for slot in scaler_handles.borrow().iter() {
-                    if slot.control.connection_id != connection_id || slot.control.stop_requested.get() {
+                    if slot.control.connection_id != connection_id
+                        || slot.control.stop_requested.get()
+                    {
                         continue;
                     }
                     slot.control.stop_requested.set(true);
@@ -942,15 +1080,19 @@ async fn run_download_task_local(
                     scaler_leased_connections
                         .set(scaler_leased_connections.get().saturating_sub(1));
                     scaler_for_task.last_action.set(ScalerAction::Shrink);
-                record_protocol_scale_metric(
-                    &scaler_metrics,
-                    dominant_protocol,
-                    ScalerAction::Shrink,
-                    false,
-                );
+                    record_protocol_scale_metric(
+                        &scaler_metrics,
+                        dominant_protocol,
+                        ScalerAction::Shrink,
+                        false,
+                    );
                     log_phase_a_info(
                         &scaler_log_path,
-                        &format!("scale_drop connection_id={} n_active={}", connection_id, scaler_for_task.n_active.get()),
+                        &format!(
+                            "scale_drop connection_id={} n_active={}",
+                            connection_id,
+                            scaler_for_task.n_active.get()
+                        ),
                     )
                     .await;
                 }
@@ -1037,13 +1179,20 @@ async fn run_download_task_local(
             };
 
             let _ = progress_tx
-                .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
+                .send(EngineEvent::Progress(
+                    progress_task_id,
+                    current_downloaded,
+                    speed,
+                ))
                 .await;
             let negotiated = progress_scaler.last_protocol.get();
             let _ = progress_tx
                 .send(EngineEvent::Protocol(
                     progress_task_id,
-                    ProtocolInfo { requested: progress_requested_http_mode, negotiated },
+                    ProtocolInfo {
+                        requested: progress_requested_http_mode,
+                        negotiated,
+                    },
                 ))
                 .await;
             let worker_snapshots = {
@@ -1143,10 +1292,11 @@ async fn run_download_task_local(
             om.note_protocol(&origin, dominant_protocol);
         }
     }
-    engine
-        .origin_memory
-        .borrow_mut()
-        .note_reuse_metrics(&origin, scaler.reuse_rate.get(), scaler.ewma_handshake_ms.get());
+    engine.origin_memory.borrow_mut().note_reuse_metrics(
+        &origin,
+        scaler.reuse_rate.get(),
+        scaler.ewma_handshake_ms.get(),
+    );
 
     // Resume observability: log warm vs cold resume outcome
     {
@@ -1160,7 +1310,7 @@ async fn run_download_task_local(
             "fresh_start"
         };
         coordinator.log(&format!(
-            "resume_observability type={} origin={} origin_memory_hit={} protocol_hint={:?} downloaded_bytes={} progress_pct={:.1}% ewma_throughput_bps={:.0} reuse_rate={:.2}",
+            "resume_observability type={} origin={} origin_memory_hit={} protocol_hint={:?} downloaded_bytes={} progress_pct={:.1}% ewma_throughput_bps={:.0} reuse_rate={:.2} prior_age_ms={} prior_weight={:.2} prior_kind={}",
             resume_label,
             origin,
             origin_memory_hit,
@@ -1173,6 +1323,9 @@ async fn run_download_task_local(
             },
             scaler.ewma_throughput.get(),
             scaler.reuse_rate.get(),
+            resume_prior_policy.age_ms,
+            resume_prior_policy.weight,
+            resume_prior_policy.kind.as_str(),
         ));
     }
 
@@ -1191,27 +1344,34 @@ async fn run_download_task_local(
     // This populates origin memory so future downloads can warn or suggest flags.
     if let Some(ref ctx) = task.request_context {
         if ctx.cookies.as_ref().map_or(false, |c| !c.is_empty()) {
-            engine
-                .origin_memory
-                .borrow_mut()
-                .note_session_requirement(&origin, SessionRequirementField::Cookies, true);
+            engine.origin_memory.borrow_mut().note_session_requirement(
+                &origin,
+                SessionRequirementField::Cookies,
+                true,
+            );
         }
         if ctx.auth.is_some() {
-            engine
-                .origin_memory
-                .borrow_mut()
-                .note_session_requirement(&origin, SessionRequirementField::Auth, true);
+            engine.origin_memory.borrow_mut().note_session_requirement(
+                &origin,
+                SessionRequirementField::Auth,
+                true,
+            );
         }
         if ctx.referer.is_some() {
-            engine
-                .origin_memory
-                .borrow_mut()
-                .note_session_requirement(&origin, SessionRequirementField::Referer, true);
+            engine.origin_memory.borrow_mut().note_session_requirement(
+                &origin,
+                SessionRequirementField::Referer,
+                true,
+            );
         }
     }
 
     // Log session memory info (Phase 3: session-aware diagnostics)
-    if let Some(session_info) = engine.origin_memory.borrow().session_info_for_origin(&origin) {
+    if let Some(session_info) = engine
+        .origin_memory
+        .borrow()
+        .session_info_for_origin(&origin)
+    {
         coordinator.log(&format!(
             "session_memory origin={} cookies_used={:?} auth_used={:?} referer_used={:?} challenge_detected={:?} challenge_kind={} saw_rate_limit={}",
             origin,
@@ -1294,46 +1454,49 @@ async fn run_download_task_local(
             .send(EngineEvent::Progress(task.id, global_downloaded.get(), 0.0))
             .await;
         let _ = event_tx
-            .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Completed))
+            .send(EngineEvent::StatusChanged(
+                task.id,
+                DownloadStatus::Completed,
+            ))
             .await;
     } else {
-    match control.halt_mode() {
-        HaltMode::Running => {
-            let _ = std::fs::remove_file(metadata_path(&task));
-            let _ = event_tx
-                .send(EngineEvent::Progress(
-                    task.id,
-                    global_downloaded.get(),
-                    0.0,
-                ))
-                .await;
-            let _ = event_tx
-                .send(EngineEvent::StatusChanged(task.id, DownloadStatus::Completed))
-                .await;
+        match control.halt_mode() {
+            HaltMode::Running => {
+                let _ = std::fs::remove_file(metadata_path(&task));
+                let _ = event_tx
+                    .send(EngineEvent::Progress(task.id, global_downloaded.get(), 0.0))
+                    .await;
+                let _ = event_tx
+                    .send(EngineEvent::StatusChanged(
+                        task.id,
+                        DownloadStatus::Completed,
+                    ))
+                    .await;
+            }
+            halt_mode => {
+                task.downloaded_size = global_downloaded.get();
+                let snapshot = TaskSnapshot {
+                    task,
+                    coordinator: coordinator.snapshot(),
+                    resume_state: ResumeBootstrap {
+                        target_connections: scaler
+                            .n_active
+                            .get()
+                            .max(control.scaler_config().borrow().min_connections)
+                            .max(1),
+                        protocol_hint: scaler.last_protocol.get(),
+                        ewma_throughput_bps: scaler.ewma_throughput.get(),
+                        peak_efficiency_bps: scaler.peak_efficiency.get(),
+                        reuse_rate: scaler.reuse_rate.get(),
+                        heartbeat_ms: control.scaler_config().borrow().heartbeat_ms.max(500),
+                        saved_at_ms: unix_time_ms(),
+                    },
+                };
+                let _ = cmd_tx
+                    .send(EngineCommand::RuntimeStopped(snapshot, halt_mode))
+                    .await;
+            }
         }
-        halt_mode => {
-            task.downloaded_size = global_downloaded.get();
-            let snapshot = TaskSnapshot {
-                task,
-                coordinator: coordinator.snapshot(),
-                resume_state: ResumeBootstrap {
-                    target_connections: scaler
-                        .n_active
-                        .get()
-                        .max(control.scaler_config().borrow().min_connections)
-                        .max(1),
-                    protocol_hint: scaler.last_protocol.get(),
-                    ewma_throughput_bps: scaler.ewma_throughput.get(),
-                    peak_efficiency_bps: scaler.peak_efficiency.get(),
-                    reuse_rate: scaler.reuse_rate.get(),
-                    heartbeat_ms: control.scaler_config().borrow().heartbeat_ms.max(500),
-                },
-            };
-            let _ = cmd_tx
-                .send(EngineCommand::RuntimeStopped(snapshot, halt_mode))
-                .await;
-        }
-    }
     }
 
     Ok(())

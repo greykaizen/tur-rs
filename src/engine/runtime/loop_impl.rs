@@ -276,12 +276,15 @@ impl DownloadEngine {
                 cmd_tx.clone(),
                 event_tx.clone(),
                 default_connections,
-            ).await;
+            )
+            .await;
             if let Err(err) = result {
-                let _ = event_tx.send(EngineEvent::StatusChanged(
-                    task_id,
-                    DownloadStatus::Error(err.to_string()),
-                )).await;
+                let _ = event_tx
+                    .send(EngineEvent::StatusChanged(
+                        task_id,
+                        DownloadStatus::Error(err.to_string()),
+                    ))
+                    .await;
             }
         });
     }
@@ -300,7 +303,7 @@ async fn coordinator_log_warm_resume(snapshot: &TaskSnapshot, label: &str) {
         let _ = f
             .write_all(
                 format!(
-                    "[{}] runtime_lifecycle event={} task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2}\n",
+                    "[{}] runtime_lifecycle event={} task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2} saved_at_ms={}\n",
                     chrono::Local::now(),
                     label,
                     snapshot.task.id,
@@ -314,6 +317,7 @@ async fn coordinator_log_warm_resume(snapshot: &TaskSnapshot, label: &str) {
                     snapshot.resume_state.protocol_hint,
                     snapshot.resume_state.ewma_throughput_bps,
                     snapshot.resume_state.reuse_rate,
+                    snapshot.resume_state.saved_at_ms,
                 )
                 .as_bytes(),
             )
@@ -334,7 +338,7 @@ async fn coordinator_log_cold_resume(snapshot: &TaskSnapshot) {
         let _ = f
             .write_all(
                 format!(
-                    "[{}] runtime_lifecycle event=persisted task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2}\n",
+                    "[{}] runtime_lifecycle event=persisted task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2} saved_at_ms={}\n",
                     chrono::Local::now(),
                     snapshot.task.id,
                     snapshot.task.downloaded_size,
@@ -347,6 +351,7 @@ async fn coordinator_log_cold_resume(snapshot: &TaskSnapshot) {
                     snapshot.resume_state.protocol_hint,
                     snapshot.resume_state.ewma_throughput_bps,
                     snapshot.resume_state.reuse_rate,
+                    snapshot.resume_state.saved_at_ms,
                 )
                 .as_bytes(),
             )
