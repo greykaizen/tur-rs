@@ -366,3 +366,86 @@ fn service_pause_resume_live_download_continues_after_resume() {
         drop(server);
     });
 }
+
+#[test]
+fn service_multi_connection_pause_resume_twice_keeps_progressing() {
+    run_local_test(async {
+        let server = TestServer::spawn(32 * 1024 * 1024);
+        let service = TurService::new(ServiceConfig {
+            connections_per_download: 4,
+            max_concurrent_tasks: 1,
+            max_total_connections: 8,
+            ..ServiceConfig::default()
+        })
+        .await
+        .expect("service starts");
+
+        let mut handle = service
+            .add_download(
+                DownloadRequest::new(server.url.clone())
+                    .dir(temp_download_dir())
+                    .connections(4)
+                    .min_connections(2)
+                    .max_connections(4),
+            )
+            .await
+            .expect("download starts");
+
+        let mut progress_mark = 0_u64;
+        for cycle in 0..2 {
+            tokio::time::timeout(Duration::from_secs(6), async {
+                loop {
+                    match handle.recv().await {
+                        Some(DownloadUpdate::Progress {
+                            downloaded_bytes, ..
+                        }) if downloaded_bytes > progress_mark + (256 * 1024) => {
+                            progress_mark = downloaded_bytes;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("event stream closed before progress in cycle {cycle}"),
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for progress before pause");
+
+            handle.pause().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match handle.recv().await {
+                        Some(DownloadUpdate::StatusChanged(DownloadStatus::Paused)) => break,
+                        Some(_) => {}
+                        None => panic!("event stream closed before paused status in cycle {cycle}"),
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for paused status");
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            handle.resume().await;
+
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    match handle.recv().await {
+                        Some(DownloadUpdate::Progress {
+                            downloaded_bytes, ..
+                        }) if downloaded_bytes > progress_mark => {
+                            progress_mark = downloaded_bytes;
+                            break;
+                        }
+                        Some(DownloadUpdate::StatusChanged(DownloadStatus::Completed)) => break,
+                        Some(_) => {}
+                        None => panic!("event stream closed before resumed progress in cycle {cycle}"),
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for resumed progress");
+        }
+
+        service.shutdown().await;
+        drop(server);
+    });
+}
