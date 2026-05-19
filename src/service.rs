@@ -530,8 +530,8 @@ pub enum DownloadUpdate {
     TotalSize(u64),
     /// Periodic worker/connection diagnostics.
     Workers(Vec<crate::engine::WorkerSnapshot>),
-    /// Current dominant protocol family observed for this task.
-    Protocol(crate::ProtocolFamily),
+    /// Current protocol information: requested mode vs negotiated family.
+    Protocol(crate::engine::ProtocolInfo),
     /// Task status transition.
     StatusChanged(DownloadStatus),
 }

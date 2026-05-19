@@ -83,7 +83,7 @@ pub use runtime::DownloadEngine;
 pub use scaler::ProtocolFamily;
 pub use types::{
     ActiveRange, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HaltMode, HttpMode,
-    ScheduleMode, WorkRequest, WorkerSnapshot, WorkerState,
+    ProtocolInfo, ScheduleMode, WorkRequest, WorkerSnapshot, WorkerState,
 };
 
 use coordinator::{
@@ -1018,6 +1018,7 @@ async fn run_download_task_local(
     let progress_total = total_size;
     let progress_handles = handles.clone();
     let progress_scaler = scaler.clone();
+    let progress_requested_http_mode = task.http_mode;
     let progress_handle = tokio::task::spawn_local(async move {
         let mut last_downloaded = progress_counter.get();
         let mut last_tick = Instant::now();
@@ -1038,10 +1039,11 @@ async fn run_download_task_local(
             let _ = progress_tx
                 .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
                 .await;
+            let negotiated = progress_scaler.last_protocol.get();
             let _ = progress_tx
                 .send(EngineEvent::Protocol(
                     progress_task_id,
-                    progress_scaler.last_protocol.get(),
+                    ProtocolInfo { requested: progress_requested_http_mode, negotiated },
                 ))
                 .await;
             let worker_snapshots = {
@@ -1145,6 +1147,34 @@ async fn run_download_task_local(
         .origin_memory
         .borrow_mut()
         .note_reuse_metrics(&origin, scaler.reuse_rate.get(), scaler.ewma_handshake_ms.get());
+
+    // Resume observability: log warm vs cold resume outcome
+    {
+        let resume_label = if is_resume {
+            if origin_memory_hit {
+                "warm_resume"
+            } else {
+                "cold_resume"
+            }
+        } else {
+            "fresh_start"
+        };
+        coordinator.log(&format!(
+            "resume_observability type={} origin={} origin_memory_hit={} protocol_hint={:?} downloaded_bytes={} progress_pct={:.1}% ewma_throughput_bps={:.0} reuse_rate={:.2}",
+            resume_label,
+            origin,
+            origin_memory_hit,
+            scaler.last_protocol.get(),
+            global_downloaded.get(),
+            if total_size > 0 {
+                global_downloaded.get() as f64 / total_size as f64 * 100.0
+            } else {
+                0.0
+            },
+            scaler.ewma_throughput.get(),
+            scaler.reuse_rate.get(),
+        ));
+    }
 
     // Check if the download was aborted due to a challenge/interstitial page.
     if let Some(challenge_reason) = control.challenge_reason.borrow().clone() {

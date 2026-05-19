@@ -142,7 +142,9 @@ impl DownloadEngine {
                         }
                         EngineCommand::Stop(id) => {
                             if let Some(control) = active_controls.get(&id) {
-                                control.request_pause();
+                                // Use drain for stop — workers finish current chunk gracefully.
+                                // Hibernating mode lets the runtime keep the snapshot in memory.
+                                control.request_drain();
                             }
                         }
                         EngineCommand::Cancel(id) => {
@@ -208,11 +210,19 @@ impl DownloadEngine {
                             self.downloads.borrow_mut().retain(|h| h.id != snapshot.task.id);
 
                             match halt_mode {
-                                HaltMode::PauseMemory => {
+                                HaltMode::Hibernating | HaltMode::Draining => {
+                                    // Hibernating: pause in memory, ready for warm resume.
+                                    // Draining: same treatment — workers finished gracefully.
                                     if deferred_resumes.remove(&snapshot.task.id) {
                                         pending_launches.push_back(PendingLaunch::Resume(snapshot));
                                     } else {
                                         paused_tasks.insert(snapshot.task.id, snapshot.clone());
+                                        let label = if matches!(halt_mode, HaltMode::Hibernating) {
+                                            "hibernated"
+                                        } else {
+                                            "drained"
+                                        };
+                                        coordinator_log_warm_resume(&snapshot, label).await;
                                         let _ = event_tx
                                             .send(EngineEvent::StatusChanged(
                                                 snapshot.task.id,
@@ -225,6 +235,7 @@ impl DownloadEngine {
                                     let path = metadata_path(&snapshot.task);
                                     persist_snapshot(&path, &snapshot)?;
                                     persisted_paths.insert(snapshot.task.id, path);
+                                    coordinator_log_cold_resume(&snapshot).await;
                                     let _ = event_tx
                                         .send(EngineEvent::StatusChanged(
                                             snapshot.task.id,
@@ -273,5 +284,72 @@ impl DownloadEngine {
                 )).await;
             }
         });
+    }
+}
+
+/// Log a warm-resume observation (task paused in memory, ready for fast resume).
+async fn coordinator_log_warm_resume(snapshot: &TaskSnapshot, label: &str) {
+    let path = crate::engine::persistence::log_path(&snapshot.task);
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = f
+            .write_all(
+                format!(
+                    "[{}] runtime_lifecycle event={} task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2}\n",
+                    chrono::Local::now(),
+                    label,
+                    snapshot.task.id,
+                    snapshot.task.downloaded_size,
+                    if snapshot.task.total_size > 0 {
+                        snapshot.task.downloaded_size as f64 / snapshot.task.total_size as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    snapshot.resume_state.target_connections,
+                    snapshot.resume_state.protocol_hint,
+                    snapshot.resume_state.ewma_throughput_bps,
+                    snapshot.resume_state.reuse_rate,
+                )
+                .as_bytes(),
+            )
+            .await;
+    }
+}
+
+/// Log a cold-resume observation (task persisted to disk, needs reload).
+async fn coordinator_log_cold_resume(snapshot: &TaskSnapshot) {
+    let path = crate::engine::persistence::log_path(&snapshot.task);
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = f
+            .write_all(
+                format!(
+                    "[{}] runtime_lifecycle event=persisted task={} downloaded_bytes={} progress_pct={:.1}% target_connections={} protocol_hint={:?} ewma_throughput_bps={:.0} reuse_rate={:.2}\n",
+                    chrono::Local::now(),
+                    snapshot.task.id,
+                    snapshot.task.downloaded_size,
+                    if snapshot.task.total_size > 0 {
+                        snapshot.task.downloaded_size as f64 / snapshot.task.total_size as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                    snapshot.resume_state.target_connections,
+                    snapshot.resume_state.protocol_hint,
+                    snapshot.resume_state.ewma_throughput_bps,
+                    snapshot.resume_state.reuse_rate,
+                )
+                .as_bytes(),
+            )
+            .await;
     }
 }

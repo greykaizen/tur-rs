@@ -40,15 +40,10 @@ impl TuiApp {
                 let status = format!("{:?}", t.status);
                 let mode = if t.dry_run { "dry" } else { "live" };
                 let protocol_label = self
-                    .protocols
+                    .protocol_infos
                     .get(&t.id)
-                    .map(|p| match p {
-                        crate::engine::ProtocolFamily::Http1 => "h1",
-                        crate::engine::ProtocolFamily::Http2 => "h2",
-                        crate::engine::ProtocolFamily::Http3 => "h3",
-                        crate::engine::ProtocolFamily::Other => "auto",
-                    })
-                    .unwrap_or("auto");
+                    .map(|info| info.display_label())
+                    .unwrap_or_else(|| "auto".to_string());
                 let worker_count = self
                     .worker_snapshots
                     .get(&t.id)

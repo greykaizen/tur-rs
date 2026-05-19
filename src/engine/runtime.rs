@@ -30,8 +30,13 @@ impl RuntimeControl {
     }
 
     pub(super) fn request_pause(&self) {
-        self.halt_mode.set(HaltMode::PauseMemory);
-        self.cancel_flag.set(true);
+        self.halt_mode.set(HaltMode::Hibernating);
+    }
+
+    /// Request workers to finish their current range/request gracefully
+    /// and not accept new work. The runtime stays alive.
+    pub(super) fn request_drain(&self) {
+        self.halt_mode.set(HaltMode::Draining);
     }
 
     pub(super) fn request_persist(&self) {
@@ -39,8 +44,12 @@ impl RuntimeControl {
         self.cancel_flag.set(true);
     }
 
+    /// Returns true if workers should not accept NEW work.
+    /// Already-running stream transfers should continue to the next
+    /// safe relinquish boundary.
     pub(super) fn is_halted(&self) -> bool {
-        self.halt_mode() != HaltMode::Running || self.cancel_flag.get()
+        matches!(self.halt_mode(), HaltMode::Draining | HaltMode::Hibernating)
+            || self.cancel_flag.get()
     }
 
     pub(super) fn scaler_config(&self) -> Rc<RefCell<ScalerConfig>> {

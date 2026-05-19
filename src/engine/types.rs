@@ -121,7 +121,9 @@ pub enum EngineEvent {
     StatusChanged(Uuid, DownloadStatus),
     TotalSize(Uuid, u64),
     Workers(Uuid, Vec<WorkerSnapshot>),
-    Protocol(Uuid, ProtocolFamily),
+    /// Protocol information — carries both requested HTTP mode and the
+    /// dominant negotiated protocol family observed during the download.
+    Protocol(Uuid, ProtocolInfo),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,9 +160,50 @@ pub enum EngineCommand {
     RuntimeStopped(TaskSnapshot, HaltMode),
 }
 
+/// Rich protocol information: what the user requested vs what was negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolInfo {
+    /// The HTTP mode that was requested (Auto, Http1, Http2, Http3).
+    pub requested: HttpMode,
+    /// The dominant protocol family actually observed/negotiated.
+    pub negotiated: ProtocolFamily,
+}
+
+impl ProtocolInfo {
+    /// Short display label (e.g. "auto→h2", "h1", "h3").
+    pub fn display_label(&self) -> String {
+        let req = match self.requested {
+            HttpMode::Auto => "auto",
+            HttpMode::Http1 => "h1",
+            HttpMode::Http2 => "h2",
+            HttpMode::Http3 => "h3",
+        };
+        let neg = self.negotiated.as_str();
+        if req == neg || self.negotiated == ProtocolFamily::Other {
+            req.to_string()
+        } else {
+            format!("{}→{}", req, neg)
+        }
+    }
+}
+
+impl Default for ProtocolInfo {
+    fn default() -> Self {
+        Self {
+            requested: HttpMode::Auto,
+            negotiated: ProtocolFamily::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HaltMode {
+    /// Task is actively running / scheduling work.
     Running,
-    PauseMemory,
+    /// Stop issuing new work; allow workers to reach a safe relinquish boundary.
+    Draining,
+    /// Runtime remains alive, client state preserved, workers owned but idle.
+    Hibernating,
+    /// Cancel/stop path that writes resumable state to disk.
     PersistToDisk,
 }
