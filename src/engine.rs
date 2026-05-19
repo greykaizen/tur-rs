@@ -789,9 +789,9 @@ async fn run_download_task_local(
             )
             .await;
 
-            if n_active == 0 {
+            if n_active < min_c {
                 let recover_target = min_c.max(1);
-                let mut recovered = 0usize;
+                let mut recovered = n_active;
                 while recovered < recover_target && scaler_engine.request_connection() {
                     let worker_control = WorkerControl::new(connection_id_counter);
                     worker_control.pending_growth_probe.set(true);
@@ -839,7 +839,7 @@ async fn run_download_task_local(
                         false,
                     );
                 }
-                if recovered > 0 {
+                if recovered > n_active {
                     scaler_for_task.n_active.set(recovered);
                     scaler_for_task.last_action.set(ScalerAction::Grow);
                     scaler_for_task
@@ -849,8 +849,9 @@ async fn run_download_task_local(
                     log_phase_a_info(
                         &scaler_log_path,
                         &format!(
-                            "scale_recover recovered={} target={} slow_start_remaining={}",
+                            "scale_recover recovered={} previous={} target={} slow_start_remaining={}",
                             recovered,
+                            n_active,
                             recover_target,
                             scaler_for_task.slow_start_remaining.get(),
                         ),
@@ -1036,17 +1037,23 @@ async fn run_download_task_local(
                 .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
                 .await;
             let worker_snapshots = {
-                progress_handles
-                    .borrow_mut()
-                    .retain(|slot| !slot.handle.is_finished());
-                let slots = progress_handles.borrow();
-                slots.iter()
-                    .map(|slot| {
-                        slot.control
+                let mut slots = progress_handles.borrow_mut();
+                let mut snapshots = Vec::with_capacity(slots.len());
+                let mut idx = 0;
+                while idx < slots.len() {
+                    if slots[idx].handle.is_finished() {
+                        slots.remove(idx);
+                        continue;
+                    }
+                    snapshots.push(
+                        slots[idx]
+                            .control
                             .diagnostics
-                            .snapshot(slot.control.transferred_bytes.get())
-                    })
-                    .collect::<Vec<_>>()
+                            .snapshot(slots[idx].control.transferred_bytes.get()),
+                    );
+                    idx += 1;
+                }
+                snapshots
             };
             let _ = progress_tx
                 .send(EngineEvent::Workers(progress_task_id, worker_snapshots))

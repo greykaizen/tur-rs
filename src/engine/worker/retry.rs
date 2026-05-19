@@ -28,12 +28,24 @@ impl ConnectionWorker {
             RetryHint::Immediate => 0,
             RetryHint::Backoff(ms) => ms,
             RetryHint::ReduceWorkers(ms) => {
-                self.scaler.skip_growth_sample.set(true);
-                self.scaler
-                    .slow_start_remaining
-                    .set(self.scaler.slow_start_remaining.get().saturating_add(1));
-                self.worker_control.stop_requested.set(true);
-                self.relinquish_range(range, current_start).await;
+                let min_connections = self.scaler.config.borrow().min_connections.max(1);
+                let active_connections = self.scaler.n_active.get();
+                if active_connections > min_connections {
+                    self.scaler.skip_growth_sample.set(true);
+                    self.scaler
+                        .slow_start_remaining
+                        .set(self.scaler.slow_start_remaining.get().saturating_add(1));
+                    self.worker_control.stop_requested.set(true);
+                    self.relinquish_range(range, current_start).await;
+                } else {
+                    self.set_worker_state(
+                        WorkerState::Retrying,
+                        Some(format!(
+                            "retry floor active={} min={}",
+                            active_connections, min_connections
+                        )),
+                    );
+                }
                 ms
             }
             RetryHint::ShrinkRange(ms) => ms,
