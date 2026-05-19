@@ -297,20 +297,34 @@ impl Coordinator {
         metrics: Rc<SchedulerMetrics>,
         adaptive_minimum_steal_bytes: Rc<Cell<u64>>,
     ) -> Result<Self> {
+        let mut resumed_assigned_ranges = 0usize;
+        let mut resumed_active_ranges = 0usize;
         let dl_ranges = snapshot
             .dl_ranges
             .into_iter()
             .map(|range| {
+                let mut assigned_to = range.assigned_to;
+                let mut status = range.status;
+                if status != RANGE_STATUS_FINISHED {
+                    if assigned_to != UNASSIGNED_CONNECTION {
+                        resumed_assigned_ranges += 1;
+                    }
+                    if status == RANGE_STATUS_ACTIVE {
+                        resumed_active_ranges += 1;
+                    }
+                    assigned_to = UNASSIGNED_CONNECTION;
+                    status = RANGE_STATUS_PENDING;
+                }
                 Rc::new(ActiveRange {
                     id: range.id,
                     label_start_mb: range.label_start_mb,
                     label_end_mb: range.label_end_mb,
                     byte_start: range.byte_start,
-                    assigned_to: Cell::new(range.assigned_to),
+                    assigned_to: Cell::new(assigned_to),
                     cursor: Cell::new(range.cursor),
                     end: Cell::new(range.end),
                     parent_range_id: range.parent_range_id,
-                    status: Cell::new(range.status),
+                    status: Cell::new(status),
                     last_sample_cursor: Cell::new(range.cursor),
                     last_sample_at_ms: Cell::new(0),
                     recent_speed_bps: Cell::new(0),
@@ -335,10 +349,12 @@ impl Coordinator {
         };
 
         coordinator.log(&format!(
-            "Coordinator resumed from snapshot. index_state_buckets={} index_state_bytes={} completed_slices={}",
+            "Coordinator resumed from snapshot. index_state_buckets={} index_state_bytes={} completed_slices={} normalized_assigned_ranges={} normalized_active_ranges={}",
             coordinator.index_state.bucket_count(),
             coordinator.index_state.storage_bytes(),
             coordinator.index_state.completed_slices(),
+            resumed_assigned_ranges,
+            resumed_active_ranges,
         ));
         Ok(coordinator)
     }

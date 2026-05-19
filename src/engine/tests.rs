@@ -1,4 +1,7 @@
 use super::*;
+use crate::engine::coordinator::{
+    CoordinatorSnapshot, DlRangeSnapshot, RANGE_STATUS_ACTIVE,
+};
 use crate::engine::http::compute_http2_client_tuning;
 use crate::engine::http::{extract_origin, strip_sensitive_headers};
 
@@ -249,4 +252,81 @@ fn service_cookie_jar_merges_into_request_context_with_dedup() {
 
     // Verify custom cookie from per-request context is preserved
     assert!(cookies.iter().any(|c| c.name == "custom"), "per-request custom cookie should be present");
+}
+
+#[test]
+fn coordinator_resume_clears_dead_assignments_and_active_status() {
+    let snapshot = CoordinatorSnapshot {
+        dl_ranges: vec![
+            DlRangeSnapshot {
+                id: 1,
+                label_start_mb: 0,
+                label_end_mb: 64,
+                byte_start: 0,
+                assigned_to: 3,
+                cursor: 8 * MB,
+                end: 16 * MB,
+                parent_range_id: None,
+                status: RANGE_STATUS_ACTIVE,
+            },
+            DlRangeSnapshot {
+                id: 2,
+                label_start_mb: 64,
+                label_end_mb: 128,
+                byte_start: 64 * MB,
+                assigned_to: 7,
+                cursor: 72 * MB,
+                end: 80 * MB,
+                parent_range_id: Some(1),
+                status: RANGE_STATUS_PENDING,
+            },
+            DlRangeSnapshot {
+                id: 3,
+                label_start_mb: 128,
+                label_end_mb: 192,
+                byte_start: 128 * MB,
+                assigned_to: 11,
+                cursor: 160 * MB,
+                end: 160 * MB,
+                parent_range_id: None,
+                status: RANGE_STATUS_FINISHED,
+            },
+        ],
+        next_unassigned_idx: 2,
+        borrow_limit_bytes: 2 * MB,
+        borrow_cursor: 0,
+        next_range_id: 4,
+        index_state_bits: vec![0],
+    };
+
+    let log_path = std::env::temp_dir().join(format!(
+        "tur-coordinator-resume-{}.log",
+        std::process::id()
+    ));
+    let metrics = Rc::new(SchedulerMetrics::default());
+    let adaptive_minimum_steal_bytes = Rc::new(Cell::new(2 * STORAGE_BLOCK_SIZE));
+
+    let coordinator = Coordinator::from_snapshot(
+        snapshot,
+        192 * MB,
+        &log_path,
+        ScheduleMode::FibAdaptive,
+        metrics,
+        adaptive_minimum_steal_bytes,
+    )
+    .expect("coordinator resumes");
+
+    let first = coordinator.dl_ranges[0].clone();
+    assert_eq!(first.assigned_to.get(), UNASSIGNED_CONNECTION);
+    assert_eq!(first.status.get(), RANGE_STATUS_PENDING);
+
+    let second = coordinator.dl_ranges[1].clone();
+    assert_eq!(second.assigned_to.get(), UNASSIGNED_CONNECTION);
+    assert_eq!(second.status.get(), RANGE_STATUS_PENDING);
+
+    let third = coordinator.dl_ranges[2].clone();
+    assert_eq!(third.status.get(), RANGE_STATUS_FINISHED);
+    assert_eq!(third.assigned_to.get(), 11);
+
+    let _ = std::fs::remove_file(log_path);
 }
