@@ -5,3 +5,9 @@ pub(super) enum InputMode {
     UrlInput,
     DirInput,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FocusPane {
+    TaskList,
+    Details,
+}

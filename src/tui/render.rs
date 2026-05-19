@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use super::app::TuiApp;
-use super::input::InputMode;
+use super::input::{FocusPane, InputMode};
 use crate::engine::WorkerState;
 
 impl TuiApp {
@@ -89,21 +89,26 @@ impl TuiApp {
             if let Some(i) = self.list_state.selected() {
                 let task = &self.tasks[i];
                 let workers = self.worker_snapshots.get(&task.id);
-                render_worker_details(task.id, workers)
+                render_worker_details(workers)
             } else {
                 "No task selected".to_string()
             }
         } else {
             "Worker details hidden. Press [d] to expand.".to_string()
         };
+        let detail_title = match self.focus_pane {
+            FocusPane::TaskList => "Connections",
+            FocusPane::Details => "Connections [focused]",
+        };
         let details = Paragraph::new(detail_text)
-            .block(Block::default().title("Connections").borders(Borders::ALL));
+            .block(Block::default().title(detail_title).borders(Borders::ALL))
+            .scroll((self.detail_scroll as u16, 0));
         f.render_widget(details, chunks[3]);
 
         // Input or Commands
         let help_text = match self.input_mode {
             InputMode::Normal => {
-                "[q]uit [n]ew [d]etails [s]pause [r]resume [c]persist-stop ↑↓ move"
+                "[q]uit [n]ew [d]etails [tab] focus [s]pause [r]resume [c]persist-stop ↑↓ move/scroll"
             }
             InputMode::UrlInput => &format!("Enter URL: {}_", self.url_buffer),
             InputMode::DirInput => {
@@ -115,10 +120,7 @@ impl TuiApp {
     }
 }
 
-fn render_worker_details(
-    _task_id: uuid::Uuid,
-    workers: Option<&Vec<crate::engine::WorkerSnapshot>>,
-) -> String {
+fn render_worker_details(workers: Option<&Vec<crate::engine::WorkerSnapshot>>) -> String {
     let Some(workers) = workers else {
         return "No worker diagnostics yet.".to_string();
     };
@@ -128,6 +130,8 @@ fn render_worker_details(
 
     let mut lines = Vec::with_capacity(workers.len() + 1);
     lines.push("id  state            speed       bytes      range".to_string());
+    let mut workers = workers.iter().collect::<Vec<_>>();
+    workers.sort_by_key(|worker| worker.connection_id);
     for worker in workers {
         let state = match worker.state {
             WorkerState::Connecting => "connecting",

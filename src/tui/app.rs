@@ -23,16 +23,18 @@ use crate::engine::{
 };
 use crate::service::RequestContext;
 
-use super::input::InputMode;
+use super::input::{FocusPane, InputMode};
 
 pub struct TuiApp {
     pub(super) tasks: Vec<DownloadTask>,
     pub(super) worker_snapshots: HashMap<Uuid, Vec<WorkerSnapshot>>,
     pub(super) list_state: ListState,
     pub(super) input_mode: InputMode,
+    pub(super) focus_pane: FocusPane,
     pub(super) url_buffer: String,
     pub(super) dir_buffer: String,
     pub(super) show_details: bool,
+    pub(super) detail_scroll: usize,
     engine_tx: mpsc::Sender<EngineCommand>,
     default_connections: usize,
     min_connections: usize,
@@ -67,9 +69,11 @@ impl TuiApp {
             worker_snapshots: HashMap::new(),
             list_state: ListState::default(),
             input_mode: InputMode::Normal,
+            focus_pane: FocusPane::TaskList,
             url_buffer: String::new(),
             dir_buffer: String::new(),
             show_details: true,
+            detail_scroll: 0,
             engine_tx,
             default_connections,
             min_connections,
@@ -151,14 +155,30 @@ impl TuiApp {
                 match self.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Up => self.prev(),
-                        KeyCode::Down => self.next(),
+                        KeyCode::Tab => {
+                            self.focus_pane = match self.focus_pane {
+                                FocusPane::TaskList => FocusPane::Details,
+                                FocusPane::Details => FocusPane::TaskList,
+                            };
+                        }
+                        KeyCode::Up => match self.focus_pane {
+                            FocusPane::TaskList => self.prev(),
+                            FocusPane::Details => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                        },
+                        KeyCode::Down => match self.focus_pane {
+                            FocusPane::TaskList => self.next(),
+                            FocusPane::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                        },
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             self.input_mode = InputMode::UrlInput;
                             self.url_buffer.clear();
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') => {
                             self.show_details = !self.show_details;
+                            if !self.show_details {
+                                self.focus_pane = FocusPane::TaskList;
+                                self.detail_scroll = 0;
+                            }
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') => {
                             self.send_command(EngineCommand::Stop)
@@ -268,6 +288,7 @@ impl TuiApp {
         };
         if !self.tasks.is_empty() {
             self.list_state.select(Some(i));
+            self.detail_scroll = 0;
         }
     }
 
@@ -284,6 +305,7 @@ impl TuiApp {
         };
         if !self.tasks.is_empty() {
             self.list_state.select(Some(i));
+            self.detail_scroll = 0;
         }
     }
 }

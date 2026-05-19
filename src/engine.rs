@@ -592,6 +592,10 @@ async fn run_download_task_local(
                 break;
             }
 
+            scaler_handles
+                .borrow_mut()
+                .retain(|slot| !slot.handle.is_finished());
+
             let current_downloaded = scaler_global_downloaded.get();
             let downloaded_in_tick = current_downloaded.saturating_sub(last_downloaded);
             last_downloaded = current_downloaded;
@@ -908,6 +912,9 @@ async fn run_download_task_local(
                 .send(EngineEvent::Progress(progress_task_id, current_downloaded, speed))
                 .await;
             let worker_snapshots = {
+                progress_handles
+                    .borrow_mut()
+                    .retain(|slot| !slot.handle.is_finished());
                 let slots = progress_handles.borrow();
                 slots.iter()
                     .map(|slot| {
