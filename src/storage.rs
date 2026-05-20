@@ -20,12 +20,12 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+use common as platform;
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use common as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
@@ -120,9 +120,13 @@ impl DownloadFile {
 
     pub async fn write_all_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         match &mut self.inner {
-            DownloadFileInner::Tokio(file) => platform::write_all_at_tokio(file, offset, data).await,
+            DownloadFileInner::Tokio(file) => {
+                platform::write_all_at_tokio(file, offset, data).await
+            }
             #[cfg(target_os = "linux")]
-            DownloadFileInner::LinuxPwrite(file) => platform::write_all_at_pwrite(file, offset, data).await,
+            DownloadFileInner::LinuxPwrite(file) => {
+                platform::write_all_at_pwrite(file, offset, data).await
+            }
             #[cfg(target_os = "linux")]
             DownloadFileInner::LinuxSplice {
                 pipe_write,
@@ -173,13 +177,16 @@ impl DownloadFile {
                 }
 
                 if middle_end < data.len() {
-                    platform::write_all_at_tokio(fallback, aligned_end, &data[middle_end..]).await?;
+                    platform::write_all_at_tokio(fallback, aligned_end, &data[middle_end..])
+                        .await?;
                 }
 
                 Ok(())
             }
             #[cfg(target_os = "macos")]
-            DownloadFileInner::MacosPwrite(file) => platform::write_all_at_pwrite(file, offset, data).await,
+            DownloadFileInner::MacosPwrite(file) => {
+                platform::write_all_at_pwrite(file, offset, data).await
+            }
             #[cfg(target_os = "windows")]
             DownloadFileInner::WindowsPwrite(file) => {
                 platform::write_all_at_windows_pwrite(file, offset, data).await

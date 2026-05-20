@@ -62,7 +62,6 @@ pub(super) enum PendingLaunch {
     Resume(TaskSnapshot),
 }
 
-
 pub(crate) struct DownloadHandle {
     pub id: Uuid,
     pub bucket: Rc<TokenBucket>,
@@ -262,7 +261,11 @@ impl DownloadEngine {
             effective_connection_budget: Cell::new(configured_budget),
             connection_budget: Cell::new(configured_budget),
             global_bandwidth_limit: Cell::new(global_bandwidth_limit_bps),
-            refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 { 50 } else { 100 }),
+            refill_interval_ms: Cell::new(if global_bandwidth_limit_bps == 0 {
+                50
+            } else {
+                100
+            }),
             last_memory_check: Cell::new(Instant::now()),
             origin_phi_ratios: RefCell::new(origin_phi_ratios),
             origin_h2_tunings: RefCell::new(origin_h2_tunings),
@@ -288,5 +291,4 @@ impl DownloadEngine {
         self.connection_budget
             .set(next.min(self.effective_connection_budget.get()));
     }
-
 }

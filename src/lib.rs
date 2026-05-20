@@ -98,4 +98,7 @@ pub use service::{
 };
 pub use storage::StorageConfig;
 
-pub use engine::{DownloadStatus, HttpMode, ProtocolFamily, ProtocolInfo, ScheduleMode, WorkerSnapshot, WorkerState};
+pub use engine::{
+    DownloadStatus, HttpMode, ProtocolFamily, ProtocolInfo, ScheduleMode, WorkerSnapshot,
+    WorkerState,
+};

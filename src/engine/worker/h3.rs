@@ -28,8 +28,11 @@ impl ConnectionWorker {
                 if let Some(ref range) = current_range {
                     local_cursor = range.cursor.get();
                     max_end = range.end.get();
-                    self.log_msg(&format!("h3 range#{} bytes={}..{}", range.id, local_cursor, max_end))
-                        .await;
+                    self.log_msg(&format!(
+                        "h3 range#{} bytes={}..{}",
+                        range.id, local_cursor, max_end
+                    ))
+                    .await;
                 } else {
                     return Ok(());
                 }
@@ -80,7 +83,10 @@ impl ConnectionWorker {
                     writer_cursor_task.set(writer_cursor_task.get().saturating_add(chunk_len));
                     body_len_task.set(body_len_task.get().saturating_add(chunk_len));
                     worker_control.transferred_bytes.set(
-                        worker_control.transferred_bytes.get().saturating_add(chunk_len),
+                        worker_control
+                            .transferred_bytes
+                            .get()
+                            .saturating_add(chunk_len),
                     );
                     global_downloaded.set(global_downloaded.get().saturating_add(chunk_len));
                 }
@@ -159,7 +165,9 @@ impl ConnectionWorker {
 
                     if status != 206 && status != 200 {
                         if status == 429 {
-                            self.origin_memory.borrow_mut().note_rate_limit(&self.origin);
+                            self.origin_memory
+                                .borrow_mut()
+                                .note_rate_limit(&self.origin);
                         }
                         tokio::time::sleep(Duration::from_millis(1000)).await;
                         continue;
@@ -179,8 +187,9 @@ impl ConnectionWorker {
                         );
                     }
 
-                    let total_ttfb_ms =
-                        attempt_timing.first_byte_ms.max(attempt_timing.request_setup_ms);
+                    let total_ttfb_ms = attempt_timing
+                        .first_byte_ms
+                        .max(attempt_timing.request_setup_ms);
                     self.record_request_classification(
                         &mut attempt_timing,
                         total_ttfb_ms,

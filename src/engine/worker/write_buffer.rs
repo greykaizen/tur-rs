@@ -44,7 +44,12 @@ impl ConnectionWorker {
         Ok(())
     }
 
-    pub(super) fn append_pending_write(&self, pending: &mut PendingWrite, offset: u64, data: &[u8]) {
+    pub(super) fn append_pending_write(
+        &self,
+        pending: &mut PendingWrite,
+        offset: u64,
+        data: &[u8],
+    ) {
         if pending.data.is_empty() {
             pending.start_offset = offset;
         }
@@ -64,7 +69,10 @@ impl ConnectionWorker {
         };
         let latency_ratio = (self.shared_write_latency_ms.get() / 10.0).max(1.0);
         let latency_target = ((WRITE_BUFFER_LARGE_BYTES as f64) * latency_ratio).round() as usize;
-        let cap = self.write_buffer_cap_bytes.get().max(WRITE_BUFFER_LARGE_BYTES);
+        let cap = self
+            .write_buffer_cap_bytes
+            .get()
+            .max(WRITE_BUFFER_LARGE_BYTES);
         speed_target
             .max(latency_target)
             .clamp(WRITE_BUFFER_MIN_BYTES, cap)
@@ -77,7 +85,11 @@ impl ConnectionWorker {
         }
     }
 
-    pub(super) fn update_pending_write_target(&self, pending: &mut PendingWrite, recent_speed_bps: f64) {
+    pub(super) fn update_pending_write_target(
+        &self,
+        pending: &mut PendingWrite,
+        recent_speed_bps: f64,
+    ) {
         let target = self.target_write_buffer_bytes(recent_speed_bps);
         self.record_write_buffer_target_metric(target);
         pending.target_bytes = target;

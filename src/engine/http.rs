@@ -35,7 +35,7 @@ pub(super) fn learn_http2_client_tuning(
     let max_send_buffer_bytes = ((stream_window_bytes as usize)
         .saturating_mul(expected_concurrency.max(observed_concurrency))
         / 2)
-        .clamp(2 * MB as usize, 8 * MB as usize);
+    .clamp(2 * MB as usize, 8 * MB as usize);
     ClientTuning {
         expected_concurrency: expected_concurrency.max(observed_concurrency),
         http2_stream_window_bytes: stream_window_bytes,
@@ -51,10 +51,13 @@ pub(super) fn build_http_client(
     learned_tuning: Option<ClientTuning>,
 ) -> (DownloadHttpClient, ClientTuning) {
     let http = crate::connector::TunedConnector::new();
-    let tuning = learned_tuning.unwrap_or_else(|| compute_http2_client_tuning(expected_concurrency));
+    let tuning =
+        learned_tuning.unwrap_or_else(|| compute_http2_client_tuning(expected_concurrency));
     let https = match http_mode {
         HttpMode::Http3 => {
-            eprintln!("WARNING: HTTP/3 mode selected but the http3 feature is not enabled. Falling back to HTTP/1.1. Rebuild with --features http3 to enable QUIC support.");
+            eprintln!(
+                "WARNING: HTTP/3 mode selected but the http3 feature is not enabled. Falling back to HTTP/1.1. Rebuild with --features http3 to enable QUIC support."
+            );
             HttpsConnectorBuilder::new()
                 .with_webpki_roots()
                 .https_or_http()
@@ -124,7 +127,11 @@ pub(super) async fn send_request_follow_redirects(
             builder = builder.header(RANGE, format!("bytes={}-{}", start, end));
         }
         // Apply session/context headers (auth, referer, cookies, custom)
-        let headers_to_use = if crossed_origin { &safe_headers } else { &owned_headers };
+        let headers_to_use = if crossed_origin {
+            &safe_headers
+        } else {
+            &owned_headers
+        };
         if let Some(headers) = headers_to_use {
             for (name, value) in headers.iter() {
                 builder = builder.header(name, value);
@@ -390,13 +397,25 @@ pub(super) fn compute_protocol_aware_steal_floor_bytes(
 ) -> u64 {
     let modifier = match protocol {
         ProtocolFamily::Http1 => {
-            if reuse_rate < 0.60 { 1.15 } else { 1.0 }
+            if reuse_rate < 0.60 {
+                1.15
+            } else {
+                1.0
+            }
         }
         ProtocolFamily::Http2 => {
-            if reuse_rate > 0.60 { 0.75 } else { 0.90 }
+            if reuse_rate > 0.60 {
+                0.75
+            } else {
+                0.90
+            }
         }
         ProtocolFamily::Http3 => {
-            if reuse_rate > 0.55 { 0.70 } else { 0.85 }
+            if reuse_rate > 0.55 {
+                0.70
+            } else {
+                0.85
+            }
         }
         ProtocolFamily::Other => 1.0,
     };

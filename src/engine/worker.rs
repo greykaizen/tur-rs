@@ -124,8 +124,7 @@ impl ConnectionWorker {
         self.clear_worker_range();
         self.log_msg(&format!(
             "range#{} relinquished at byte={} for scale-down",
-            range.id,
-            local_cursor
+            range.id, local_cursor
         ))
         .await;
     }
@@ -264,7 +263,7 @@ impl ConnectionWorker {
                     let heartbeat_ms = self.scaler.config.borrow().heartbeat_ms.max(1);
                     let adjusted_handshake_ms = ((attempt_timing.handshake_cost_ms as f64)
                         * protocol_growth_shield_multiplier(protocol))
-                        .round() as u64;
+                    .round() as u64;
                     let extra_heartbeats =
                         ((adjusted_handshake_ms + heartbeat_ms - 1) / heartbeat_ms) as u32;
                     self.scaler.slow_start_remaining.set(
@@ -287,9 +286,9 @@ impl ConnectionWorker {
 
         let total_requests = self.scaler.total_request_count.get();
         if total_requests > 0 {
-            self.scaler.reuse_rate.set(
-                self.scaler.reused_count.get() as f64 / total_requests as f64,
-            );
+            self.scaler
+                .reuse_rate
+                .set(self.scaler.reused_count.get() as f64 / total_requests as f64);
         }
 
         self.log_msg(&format!(
@@ -334,7 +333,15 @@ impl ConnectionWorker {
             .await
         {
             let _ = f
-                .write_all(format!("[{}] conn={}: {}\n", chrono::Local::now(), self.connection_id, msg).as_bytes())
+                .write_all(
+                    format!(
+                        "[{}] conn={}: {}\n",
+                        chrono::Local::now(),
+                        self.connection_id,
+                        msg
+                    )
+                    .as_bytes(),
+                )
                 .await;
         }
     }
@@ -353,7 +360,11 @@ impl ConnectionWorker {
     async fn run_live(self) -> Result<()> {
         let worker_started_at = Instant::now();
         let file_open_started = Instant::now();
-        let mut file = storage::open_download_file_for_write_with_config(&self.file_path, &self.storage_config).await?;
+        let mut file = storage::open_download_file_for_write_with_config(
+            &self.file_path,
+            &self.storage_config,
+        )
+        .await?;
         let file_backend = file.backend();
         let open_file_ms = file_open_started.elapsed().as_millis() as u64;
 
@@ -370,7 +381,7 @@ impl ConnectionWorker {
                 }
                 let write_ms = write_started.elapsed().as_millis() as u64;
                 SchedulerMetrics::add(&metrics_clone.file_write_ms, write_ms);
-                
+
                 data.clear();
                 let _ = recycle_tx.send(data);
             }
@@ -460,10 +471,16 @@ impl ConnectionWorker {
                         ))
                         .await;
                     } else if no_more_work_hint {
-                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
+                        self.set_worker_state(
+                            WorkerState::Finished,
+                            Some("no more work".to_string()),
+                        );
                         break;
                     } else {
-                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
+                        self.set_worker_state(
+                            WorkerState::Finished,
+                            Some("no more work".to_string()),
+                        );
                         break;
                     }
                 }
@@ -595,7 +612,8 @@ impl ConnectionWorker {
                 self.log_msg(&format!(
                     "alt_svc_h3_cached origin={} port={}",
                     self.origin, h3_port,
-                )).await;
+                ))
+                .await;
             }
 
             let mut stream = response.into_body();
@@ -605,9 +623,13 @@ impl ConnectionWorker {
             let mut halted_during_stream = false;
             while let Some(frame_result) = stream.frame().await {
                 if self.control.is_halted() {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                     self.relinquish_range(&range, local_cursor).await;
                     current_range = None;
                     current_range_id = None;
@@ -649,12 +671,10 @@ impl ConnectionWorker {
                                 self.origin, challenge_str
                             ))
                             .await;
-                            *self.control.challenge_reason.borrow_mut() = Some(
-                                format!(
-                                    "download aborted: server returned challenge/interstitial page ({})",
-                                    challenge_str
-                                ),
-                            );
+                            *self.control.challenge_reason.borrow_mut() = Some(format!(
+                                "download aborted: server returned challenge/interstitial page ({})",
+                                challenge_str
+                            ));
                             self.control.request_pause();
                             break;
                         } else {
@@ -677,13 +697,12 @@ impl ConnectionWorker {
                     let total_ttfb_ms = attempt_timing
                         .request_setup_ms
                         .saturating_add(attempt_timing.first_byte_ms);
-                    self
-                        .record_request_classification(
-                            &mut attempt_timing,
-                            total_ttfb_ms,
-                            protocol_family,
-                        )
-                        .await;
+                    self.record_request_classification(
+                        &mut attempt_timing,
+                        total_ttfb_ms,
+                        protocol_family,
+                    )
+                    .await;
                     if startup.first_byte_ms.is_none() {
                         startup.first_byte_ms = Some(attempt_timing.first_byte_ms);
                         startup.total_to_first_byte_ms =
@@ -702,9 +721,13 @@ impl ConnectionWorker {
 
                 let max_end = range.end.get();
                 if local_cursor >= max_end {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                     current_range = None;
                     break;
                 }
@@ -715,14 +738,12 @@ impl ConnectionWorker {
                 let new_pos = local_cursor + to_write as u64;
                 range.cursor.set(new_pos);
                 self.update_range_speed_sample(&range, new_pos);
-                self.global_downloaded.set(
-                    self.global_downloaded
-                        .get()
-                        .saturating_add(to_write as u64),
-                );
+                self.global_downloaded
+                    .set(self.global_downloaded.get().saturating_add(to_write as u64));
                 self.index_state.mark_completed_span(local_cursor, new_pos);
                 made_progress_this_attempt = true;
-                attempt_timing.bytes_written = attempt_timing.bytes_written.saturating_add(to_write as u64);
+                attempt_timing.bytes_written =
+                    attempt_timing.bytes_written.saturating_add(to_write as u64);
                 attempt_timing.chunks = attempt_timing.chunks.saturating_add(1);
                 self.worker_control.transferred_bytes.set(
                     self.worker_control
@@ -731,21 +752,32 @@ impl ConnectionWorker {
                         .saturating_add(to_write as u64),
                 );
                 local_cursor = new_pos;
-                let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
-                self.worker_control.diagnostics.set_speed_bps(recent_speed_bps);
+                let recent_speed_bps =
+                    estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
+                self.worker_control
+                    .diagnostics
+                    .set_speed_bps(recent_speed_bps);
                 self.set_worker_state(WorkerState::Downloading, None);
                 self.set_worker_range(&range, local_cursor);
                 self.update_pending_write_target(&mut pending_write, recent_speed_bps);
                 if pending_write.data.len() >= pending_write.target_bytes {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                 }
 
                 if self.control.is_halted() {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                     self.relinquish_range(&range, local_cursor).await;
                     current_range = None;
                     current_range_id = None;
@@ -761,15 +793,17 @@ impl ConnectionWorker {
                     self.scaler.last_protocol.get(),
                     self.ewma_connection_rtt_ms.get(),
                 );
-                SchedulerMetrics::update_max(&self.metrics.max_prefetch_trigger_bytes, prefetch_trigger_bytes);
+                SchedulerMetrics::update_max(
+                    &self.metrics.max_prefetch_trigger_bytes,
+                    prefetch_trigger_bytes,
+                );
                 if should_prefetch(
                     remaining,
                     recent_speed_bps,
                     self.effective_prefetch_limit_bytes(),
                     self.scaler.last_protocol.get(),
                     self.ewma_connection_rtt_ms.get(),
-                )
-                    && prefetch_handle.is_none()
+                ) && prefetch_handle.is_none()
                     && prefetched_range.is_none()
                     && !no_more_work_hint
                 {
@@ -790,9 +824,13 @@ impl ConnectionWorker {
                 }
 
                 if self.should_exit_for_scale_down() {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                     self.relinquish_range(&range, local_cursor).await;
                     if let Some(handle) = prefetch_handle {
                         handle.abort();
@@ -804,9 +842,13 @@ impl ConnectionWorker {
                 }
 
                 if to_write < chunk.len() {
-                    self
-                        .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                        .await?;
+                    self.flush_pending_write(
+                        &write_tx,
+                        &mut recycle_rx,
+                        &mut pending_write,
+                        &mut attempt_timing,
+                    )
+                    .await?;
                     current_range = None;
                     current_range_id = None;
                     consecutive_failures = 0;
@@ -826,13 +868,24 @@ impl ConnectionWorker {
             }
 
             if let Some(reason) = stream_failed {
-                self
-                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                    .await?;
+                self.flush_pending_write(
+                    &write_tx,
+                    &mut recycle_rx,
+                    &mut pending_write,
+                    &mut attempt_timing,
+                )
+                .await?;
                 if made_progress_this_attempt {
                     consecutive_failures = 0;
-                    self.log_attempt_summary(&range, start, end, &attempt_timing, "reopen", http_version)
-                        .await;
+                    self.log_attempt_summary(
+                        &range,
+                        start,
+                        end,
+                        &attempt_timing,
+                        "reopen",
+                        http_version,
+                    )
+                    .await;
                     self.log_msg(&format!(
                         "{}; reopening range#{} from byte={}",
                         reason,
@@ -861,13 +914,24 @@ impl ConnectionWorker {
                 consecutive_failures = 0;
             }
             if local_cursor >= range.end.get() {
-                self
-                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                    .await?;
+                self.flush_pending_write(
+                    &write_tx,
+                    &mut recycle_rx,
+                    &mut pending_write,
+                    &mut attempt_timing,
+                )
+                .await?;
                 range.status.set(RANGE_STATUS_FINISHED);
                 SchedulerMetrics::add(&self.metrics.completed_ranges, 1);
-                self.log_attempt_summary(&range, start, end, &attempt_timing, "complete", http_version)
-                    .await;
+                self.log_attempt_summary(
+                    &range,
+                    start,
+                    end,
+                    &attempt_timing,
+                    "complete",
+                    http_version,
+                )
+                .await;
                 current_range = None;
                 current_range_id = None;
                 consecutive_failures = 0;
@@ -876,11 +940,22 @@ impl ConnectionWorker {
                 self.set_worker_state(WorkerState::Finished, Some("range complete".to_string()));
                 self.clear_worker_range();
             } else if made_progress_this_attempt {
-                self
-                    .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut attempt_timing)
-                    .await?;
-                self.log_attempt_summary(&range, start, end, &attempt_timing, "partial", http_version)
-                    .await;
+                self.flush_pending_write(
+                    &write_tx,
+                    &mut recycle_rx,
+                    &mut pending_write,
+                    &mut attempt_timing,
+                )
+                .await?;
+                self.log_attempt_summary(
+                    &range,
+                    start,
+                    end,
+                    &attempt_timing,
+                    "partial",
+                    http_version,
+                )
+                .await;
                 self.reset_pending_write_target(&mut pending_write);
             }
         }
@@ -900,9 +975,13 @@ impl ConnectionWorker {
 
         if !pending_write.data.is_empty() {
             let mut final_timing = AttemptTiming::default();
-            self
-                .flush_pending_write(&write_tx, &mut recycle_rx, &mut pending_write, &mut final_timing)
-                .await?;
+            self.flush_pending_write(
+                &write_tx,
+                &mut recycle_rx,
+                &mut pending_write,
+                &mut final_timing,
+            )
+            .await?;
         }
         if let Some(handle) = prefetch_handle {
             handle.abort();
@@ -948,5 +1027,4 @@ impl ConnectionWorker {
         ))
         .await;
     }
-
 }

@@ -24,7 +24,11 @@ impl TuiApp {
         // Title
         let title = Paragraph::new(" Tur Download Manager ")
             .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
         f.render_widget(title, chunks[0]);
 
         // Tasks List
@@ -117,9 +121,7 @@ impl TuiApp {
                 "[q]uit [n]ew [d]etails [tab] focus [p]ause [r]esume [c]ancel/stop ↑↓ move/scroll"
             }
             InputMode::UrlInput => &format!("Enter URL: {}_", self.url_buffer),
-            InputMode::DirInput => {
-                &format!("Enter Dir (empty for current): {}_", self.dir_buffer)
-            }
+            InputMode::DirInput => &format!("Enter Dir (empty for current): {}_", self.dir_buffer),
         };
         let help = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL));
         f.render_widget(help, chunks[4]);
@@ -153,7 +155,10 @@ fn render_worker_details(workers: Option<&Vec<crate::engine::WorkerSnapshot>>) -
         } else {
             "0.00 MB/s".to_string()
         };
-        let bytes = format!("{:.1} MB", worker.transferred_bytes as f64 / (1024.0 * 1024.0));
+        let bytes = format!(
+            "{:.1} MB",
+            worker.transferred_bytes as f64 / (1024.0 * 1024.0)
+        );
         let range = match (worker.range_start, worker.range_cursor, worker.range_end) {
             (Some(start), Some(cursor), Some(end)) => {
                 format!(

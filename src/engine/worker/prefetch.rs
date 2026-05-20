@@ -53,7 +53,10 @@ impl ConnectionWorker {
                         self.set_worker_state(WorkerState::Downloading, None);
                         self.set_worker_range(range, local_cursor);
                     } else {
-                        self.set_worker_state(WorkerState::Finished, Some("no more work".to_string()));
+                        self.set_worker_state(
+                            WorkerState::Finished,
+                            Some("no more work".to_string()),
+                        );
                         break;
                     }
                 }
@@ -77,11 +80,17 @@ impl ConnectionWorker {
                 .set(self.global_downloaded.get().saturating_add(step));
             self.index_state.mark_completed_span(local_cursor, new_pos);
             local_cursor = new_pos;
+            self.worker_control.transferred_bytes.set(
+                self.worker_control
+                    .transferred_bytes
+                    .get()
+                    .saturating_add(step),
+            );
+            let recent_speed_bps =
+                estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
             self.worker_control
-                .transferred_bytes
-                .set(self.worker_control.transferred_bytes.get().saturating_add(step));
-            let recent_speed_bps = estimate_speed_bps(range_started_at, range_start_cursor, new_pos);
-            self.worker_control.diagnostics.set_speed_bps(recent_speed_bps);
+                .diagnostics
+                .set_speed_bps(recent_speed_bps);
             self.set_worker_state(WorkerState::Downloading, None);
             self.set_worker_range(&range, local_cursor);
 
@@ -124,9 +133,7 @@ impl ConnectionWorker {
         Ok(())
     }
 
-    pub(super) fn spawn_prefetch_request(
-        &self,
-    ) -> JoinHandle<Result<Option<Rc<ActiveRange>>>> {
+    pub(super) fn spawn_prefetch_request(&self) -> JoinHandle<Result<Option<Rc<ActiveRange>>>> {
         let coordinator_tx = self.coordinator_tx.clone();
         let connection_id = self.connection_id;
         let metrics = self.metrics.clone();
@@ -194,6 +201,9 @@ async fn request_work_inner(
         Ok(range) => range,
         Err(_) => None,
     };
-    SchedulerMetrics::add(&metrics.request_wait_ms, waited.elapsed().as_millis() as u64);
+    SchedulerMetrics::add(
+        &metrics.request_wait_ms,
+        waited.elapsed().as_millis() as u64,
+    );
     Ok(result)
 }

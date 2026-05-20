@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::{Buf as _, Bytes};
 use http::Method;
 
@@ -65,9 +65,9 @@ impl H3Client {
             .map_err(|e| anyhow!("H3 connect to {addr} failed: {e}"))?;
 
         let (mut connection, mut send_request) = h3::client::builder()
-            .build::<h3_quinn::Connection, h3_quinn::OpenStreams, Bytes>(
-                h3_quinn::Connection::new(connect),
-            )
+            .build::<h3_quinn::Connection, h3_quinn::OpenStreams, Bytes>(h3_quinn::Connection::new(
+                connect,
+            ))
             .await
             .map_err(|e| anyhow!("H3 handshake failed: {e}"))?;
 

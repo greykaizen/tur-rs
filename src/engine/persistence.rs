@@ -12,7 +12,6 @@ pub(super) fn load_snapshot(path: &Path) -> Result<TaskSnapshot> {
     Ok(bincode::deserialize(&bytes)?)
 }
 
-
 pub(super) fn log_path(task: &DownloadTask) -> PathBuf {
     log_root(task).join(format!("{}.log", task.filename))
 }
@@ -41,7 +40,6 @@ pub(super) fn ensure_parent_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 
 pub(super) fn unix_time_ms() -> u64 {
     SystemTime::now()

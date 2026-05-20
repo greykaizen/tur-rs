@@ -19,11 +19,15 @@ pub async fn open_download_file_for_write(
     path: &Path,
     config: &StorageConfig,
 ) -> Result<DownloadFile> {
-    if !config.no_io_uring && let Ok(file) = open_download_file_for_write_linux_uring(path).await {
+    if !config.no_io_uring
+        && let Ok(file) = open_download_file_for_write_linux_uring(path).await
+    {
         return Ok(file);
     }
 
-    if config.use_splice && let Ok(file) = open_download_file_for_write_linux_splice(path).await {
+    if config.use_splice
+        && let Ok(file) = open_download_file_for_write_linux_splice(path).await
+    {
         return Ok(file);
     }
 
@@ -40,11 +44,7 @@ pub async fn write_all_at_tokio(file: &mut File, offset: u64, data: &[u8]) -> Re
     Ok(())
 }
 
-pub async fn write_all_at_pwrite(
-    file: &mut std::fs::File,
-    offset: u64,
-    data: &[u8],
-) -> Result<()> {
+pub async fn write_all_at_pwrite(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
     let data = data.to_vec();
@@ -67,7 +67,7 @@ pub async fn write_all_at_splice(
     offset: u64,
     data: &[u8],
 ) -> Result<()> {
-    use rustix::pipe::{splice, SpliceFlags};
+    use rustix::pipe::{SpliceFlags, splice};
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
@@ -101,7 +101,10 @@ pub async fn write_all_at_splice(
                 Err(rustix::io::Errno::NOSYS) | Err(rustix::io::Errno::INVAL) => {
                     let _ = pipe_read_clone.set_len(0);
                     let written_sofar = written;
-                    file_clone.write_all_at(&data_vec[written_sofar as usize..], offset + written_sofar)?;
+                    file_clone.write_all_at(
+                        &data_vec[written_sofar as usize..],
+                        offset + written_sofar,
+                    )?;
                     return Ok::<_, anyhow::Error>(());
                 }
                 Err(e) => {
@@ -151,8 +154,7 @@ async fn open_download_file_for_write_linux_splice(path: &Path) -> Result<Downlo
             .custom_flags(0)
             .open(&path)
             .map_err(|e| anyhow!("failed to open file for splice: {e}"))?;
-        let (pipe_read_fd, pipe_write_fd) =
-            pipe().map_err(|e| anyhow!("pipe() failed: {e}"))?;
+        let (pipe_read_fd, pipe_write_fd) = pipe().map_err(|e| anyhow!("pipe() failed: {e}"))?;
         Ok::<_, anyhow::Error>((file, pipe_read_fd, pipe_write_fd))
     })
     .await

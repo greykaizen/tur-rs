@@ -80,7 +80,8 @@ impl OriginMemoryStore {
                 enabled: true,
             };
         };
-        let Ok(entries) = bincode::deserialize::<HashMap<String, PersistedOriginProfile>>(&bytes) else {
+        let Ok(entries) = bincode::deserialize::<HashMap<String, PersistedOriginProfile>>(&bytes)
+        else {
             return Self {
                 entries: HashMap::new(),
                 usage_tick: 0,
@@ -119,22 +120,25 @@ impl OriginMemoryStore {
 
     fn touch_profile(&mut self, origin: &str) -> &mut PersistedOriginProfile {
         let tick = self.next_tick();
-        let profile = self.entries.entry(origin.to_string()).or_insert(PersistedOriginProfile {
-            phi_ratio: None,
-            h2_tuning: None,
-            protocol_hint: None,
-            reuse_rate: None,
-            handshake_ms: None,
-            supports_ranges: None,
-            content_length_reliable: None,
-            saw_rate_limit: false,
-            cookies_used: None,
-            auth_used: None,
-            referer_used: None,
-            challenge_detected: None,
-            challenge_kind: None,
-            last_used_tick: tick,
-        });
+        let profile = self
+            .entries
+            .entry(origin.to_string())
+            .or_insert(PersistedOriginProfile {
+                phi_ratio: None,
+                h2_tuning: None,
+                protocol_hint: None,
+                reuse_rate: None,
+                handshake_ms: None,
+                supports_ranges: None,
+                content_length_reliable: None,
+                saw_rate_limit: false,
+                cookies_used: None,
+                auth_used: None,
+                referer_used: None,
+                challenge_detected: None,
+                challenge_kind: None,
+                last_used_tick: tick,
+            });
         profile.last_used_tick = tick;
         profile
     }
@@ -387,7 +391,9 @@ pub(super) fn origin_key(url: &str) -> String {
 
 fn origin_memory_path() -> PathBuf {
     if let Ok(xdg_cache_home) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg_cache_home).join("tur").join("origin-memory.bin");
+        return PathBuf::from(xdg_cache_home)
+            .join("tur")
+            .join("origin-memory.bin");
     }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home)
@@ -425,7 +431,10 @@ mod tests {
         store.note_h2_tuning(origin, tuning);
 
         let mut reloaded = OriginMemoryStore::load_enabled(true);
-        assert_eq!(reloaded.protocol_hint_for_origin(origin), Some(ProtocolFamily::Http2));
+        assert_eq!(
+            reloaded.protocol_hint_for_origin(origin),
+            Some(ProtocolFamily::Http2)
+        );
         assert_eq!(
             reloaded.hydrate_phi_ratios().current_ratio(origin),
             Some(1.7)

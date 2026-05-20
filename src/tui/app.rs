@@ -7,18 +7,14 @@ use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    widgets::ListState,
-    Terminal,
-};
+use ratatui::{Terminal, backend::CrosstermBackend, widgets::ListState};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::engine::{
-    DownloadTask, DownloadStatus, EngineCommand, EngineEvent, HttpMode, ProtocolInfo, ScheduleMode,
+    DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ProtocolInfo, ScheduleMode,
     WorkerSnapshot,
 };
 use crate::service::RequestContext;
@@ -130,10 +126,7 @@ impl TuiApp {
         }
     }
 
-    pub async fn run(
-        &mut self,
-        mut rx: mpsc::Receiver<EngineEvent>,
-    ) -> Result<()> {
+    pub async fn run(&mut self, mut rx: mpsc::Receiver<EngineEvent>) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -165,11 +158,15 @@ impl TuiApp {
                         }
                         KeyCode::Up => match self.focus_pane {
                             FocusPane::TaskList => self.prev(),
-                            FocusPane::Details => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                            FocusPane::Details => {
+                                self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                            }
                         },
                         KeyCode::Down => match self.focus_pane {
                             FocusPane::TaskList => self.next(),
-                            FocusPane::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                            FocusPane::Details => {
+                                self.detail_scroll = self.detail_scroll.saturating_add(1)
+                            }
                         },
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             self.input_mode = InputMode::UrlInput;
@@ -182,9 +179,10 @@ impl TuiApp {
                                 self.detail_scroll = 0;
                             }
                         }
-                        KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char('s') | KeyCode::Char('S') => {
-                            self.send_command(EngineCommand::Stop)
-                        }
+                        KeyCode::Char('p')
+                        | KeyCode::Char('P')
+                        | KeyCode::Char('s')
+                        | KeyCode::Char('S') => self.send_command(EngineCommand::Stop),
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             self.send_command(EngineCommand::Resume)
                         }

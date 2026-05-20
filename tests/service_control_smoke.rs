@@ -125,7 +125,11 @@ fn handle_connection(stream: &mut TcpStream, total_size: usize) {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(total_size.saturating_sub(1))
             .min(total_size.saturating_sub(1));
-        (start.min(total_size.saturating_sub(1)), end, "HTTP/1.1 206 Partial Content")
+        (
+            start.min(total_size.saturating_sub(1)),
+            end,
+            "HTTP/1.1 206 Partial Content",
+        )
     } else {
         (0, total_size.saturating_sub(1), "HTTP/1.1 200 OK")
     };
@@ -444,7 +448,9 @@ fn service_multi_connection_pause_resume_twice_keeps_progressing() {
                         }
                         Some(DownloadUpdate::StatusChanged(DownloadStatus::Completed)) => break,
                         Some(_) => {}
-                        None => panic!("event stream closed before resumed progress in cycle {cycle}"),
+                        None => {
+                            panic!("event stream closed before resumed progress in cycle {cycle}")
+                        }
                     }
                 }
             })

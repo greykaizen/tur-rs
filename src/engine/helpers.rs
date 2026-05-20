@@ -8,7 +8,11 @@ use tokio::io::AsyncWriteExt;
 use super::scaler::{ProtocolFamily, Scaler};
 
 /// Estimate current download speed from position deltas.
-pub(super) fn estimate_speed_bps(started_at: Instant, start_offset: u64, current_offset: u64) -> f64 {
+pub(super) fn estimate_speed_bps(
+    started_at: Instant,
+    start_offset: u64,
+    current_offset: u64,
+) -> f64 {
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed <= 0.0 {
         return 0.0;
@@ -60,9 +64,7 @@ pub(super) fn update_scaler_signal_stats(scaler: &Rc<Scaler>, sample_bps: f64) -
         let mut ring = scaler.sample_ring.borrow_mut();
         ring[scaler.sample_head.get()] = sample_bps;
     }
-    scaler
-        .sample_head
-        .set((scaler.sample_head.get() + 1) % 10);
+    scaler.sample_head.set((scaler.sample_head.get() + 1) % 10);
     scaler
         .sample_count
         .set((scaler.sample_count.get() + 1).min(10));
@@ -205,7 +207,8 @@ pub(super) async fn update_reuse_health(
     scaler.reuse_rate.set(rate);
     let threshold = super::http::protocol_effective_add_threshold(protocol, rate).clamp(0.04, 0.15);
     scaler.effective_add_threshold.set(threshold);
-    let (degraded_threshold, recovered_threshold) = super::http::protocol_reuse_thresholds(protocol);
+    let (degraded_threshold, recovered_threshold) =
+        super::http::protocol_reuse_thresholds(protocol);
 
     let was_low = scaler.reuse_health_low.get();
     if !was_low && rate < degraded_threshold {
@@ -250,5 +253,3 @@ pub(super) async fn log_phase_a_info(log_path: &Path, msg: &str) {
             .await;
     }
 }
-
-

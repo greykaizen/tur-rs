@@ -44,8 +44,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::engine::{
-    DownloadEngine,
-    DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode, ScheduleMode,
+    DownloadEngine, DownloadStatus, DownloadTask, EngineCommand, EngineEvent, HttpMode,
+    ScheduleMode,
 };
 use crate::storage::StorageConfig;
 
@@ -65,7 +65,11 @@ pub struct CookieEntry {
 }
 
 impl CookieEntry {
-    pub fn new(name: impl Into<String>, value: impl Into<String>, domain: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             value: value.into(),
@@ -109,7 +113,14 @@ impl CookieEntry {
             }
         }
 
-        Some(Self { name, value, domain, path, secure, expires })
+        Some(Self {
+            name,
+            value,
+            domain,
+            path,
+            secure,
+            expires,
+        })
     }
 
     /// Format as a `Cookie` request header value.
@@ -126,7 +137,9 @@ pub struct CookieJar {
 
 impl CookieJar {
     pub fn new() -> Self {
-        Self { cookies: Vec::new() }
+        Self {
+            cookies: Vec::new(),
+        }
     }
 
     /// Add (or replace) a cookie.
@@ -141,12 +154,15 @@ impl CookieJar {
     pub fn match_url(&self, url: &Url) -> Vec<&CookieEntry> {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
-        self.cookies.iter().filter(|c| {
-            let domain_match = host == c.domain || host.ends_with(&format!(".{}", c.domain));
-            let path_match = path.starts_with(&c.path);
-            let secure_ok = !c.secure || url.scheme() == "https";
-            domain_match && path_match && secure_ok
-        }).collect()
+        self.cookies
+            .iter()
+            .filter(|c| {
+                let domain_match = host == c.domain || host.ends_with(&format!(".{}", c.domain));
+                let path_match = path.starts_with(&c.path);
+                let secure_ok = !c.secure || url.scheme() == "https";
+                domain_match && path_match && secure_ok
+            })
+            .collect()
     }
 
     /// Format all matching cookies as a single `Cookie` header value.
@@ -155,7 +171,13 @@ impl CookieJar {
         if matched.is_empty() {
             return None;
         }
-        Some(matched.iter().map(|c| c.to_request_value()).collect::<Vec<_>>().join("; "))
+        Some(
+            matched
+                .iter()
+                .map(|c| c.to_request_value())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 
     /// Import cookies from a string in Netscape cookie-file format or simple "name=value" lines.
@@ -207,8 +229,12 @@ impl CookieJar {
         out
     }
 
-    pub fn len(&self) -> usize { self.cookies.len() }
-    pub fn is_empty(&self) -> bool { self.cookies.is_empty() }
+    pub fn len(&self) -> usize {
+        self.cookies.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
+    }
 }
 
 /// Request-level context for authenticated / session-aware downloading.
@@ -493,22 +519,26 @@ impl DownloadRequest {
 
     /// Convenience: set a Bearer token for Authorization.
     pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.request_context.get_or_insert_with(RequestContext::new)
+        self.request_context
+            .get_or_insert_with(RequestContext::new)
             .auth = Some(format!("Bearer {}", token.into()));
         self
     }
 
     /// Convenience: set the Referer header.
     pub fn referer(mut self, url: impl Into<String>) -> Self {
-        self.request_context.get_or_insert_with(RequestContext::new)
+        self.request_context
+            .get_or_insert_with(RequestContext::new)
             .referer = Some(url.into());
         self
     }
 
     /// Convenience: add a custom header.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.request_context.get_or_insert_with(RequestContext::new)
-            .headers.insert(name.into(), value.into());
+        self.request_context
+            .get_or_insert_with(RequestContext::new)
+            .headers
+            .insert(name.into(), value.into());
         self
     }
 }
@@ -683,7 +713,12 @@ impl TurService {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<DownloadUpdate>();
 
         let filename = request.filename.clone().unwrap_or_else(|| {
-            request.url.split('/').last().unwrap_or("unknown").to_string()
+            request
+                .url
+                .split('/')
+                .last()
+                .unwrap_or("unknown")
+                .to_string()
         });
 
         // Merge per-request cookies into the service cookie jar
@@ -705,7 +740,9 @@ impl TurService {
             downloaded_size: 0,
             status: DownloadStatus::Queued,
             speed: 0.0,
-            connections: request.connections.unwrap_or(self.engine.connections_per_download),
+            connections: request
+                .connections
+                .unwrap_or(self.engine.connections_per_download),
             dry_run: request.dry_run,
             dry_run_size_mb: request.dry_run_size_mb,
             borrow_limit_mb: request.borrow_limit_mb.unwrap_or(2),
@@ -728,7 +765,10 @@ impl TurService {
                 let mut existing = ctx.cookies.take().unwrap_or_default();
                 // Only add service cookies that don't shadow existing per-request cookies
                 for c in jar_cookies {
-                    if !existing.iter().any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path) {
+                    if !existing
+                        .iter()
+                        .any(|ec| ec.name == c.name && ec.domain == c.domain && ec.path == c.path)
+                    {
                         existing.push(c);
                     }
                 }

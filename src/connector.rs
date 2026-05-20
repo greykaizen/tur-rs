@@ -1,9 +1,9 @@
 use hyper::Uri;
 use hyper_util::client::legacy::connect::HttpConnector;
 use socket2::{SockRef, TcpKeepalive};
+use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::ErrorKind;
-use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;

@@ -41,11 +41,7 @@ pub async fn write_all_at_tokio(file: &mut File, offset: u64, data: &[u8]) -> Re
     Ok(())
 }
 
-pub async fn write_all_at_pwrite(
-    file: &mut std::fs::File,
-    offset: u64,
-    data: &[u8],
-) -> Result<()> {
+pub async fn write_all_at_pwrite(file: &mut std::fs::File, offset: u64, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
     let data = data.to_vec();

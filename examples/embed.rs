@@ -25,13 +25,16 @@ async fn main() -> Result<()> {
     }
 
     let url = &args[1];
-    let dir = args.get(2).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let dir = args
+        .get(2)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // Create the service inside a LocalSet (required for !Send engine types).
     let local = LocalSet::new();
-    local.run_until(async {
-        run_service(url, &dir).await
-    }).await
+    local
+        .run_until(async { run_service(url, &dir).await })
+        .await
 }
 
 async fn run_service(url: &str, dir: &PathBuf) -> Result<()> {
@@ -46,9 +49,7 @@ async fn run_service(url: &str, dir: &PathBuf) -> Result<()> {
     println!("tur-rs service started");
 
     // 2. Submit a download request
-    let request = DownloadRequest::new(url)
-        .dir(dir.clone())
-        .connections(4);
+    let request = DownloadRequest::new(url).dir(dir.clone()).connections(4);
 
     let mut handle = service.add_download(request).await?;
     println!("Download {} queued", handle.id);
@@ -65,7 +66,10 @@ async fn run_service(url: &str, dir: &PathBuf) -> Result<()> {
             DownloadUpdate::Protocol(protocol) => {
                 println!("Protocol: {:?}", protocol);
             }
-            DownloadUpdate::Progress { downloaded_bytes, speed_bps } => {
+            DownloadUpdate::Progress {
+                downloaded_bytes,
+                speed_bps,
+            } => {
                 println!(
                     "Progress: {} bytes @ {:.1} MiB/s",
                     downloaded_bytes,

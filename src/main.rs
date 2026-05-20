@@ -75,7 +75,10 @@ fn build_request_context(cli: &Cli) -> Option<RequestContext> {
                 ctx = ctx.header(name, value);
             }
         } else {
-            eprintln!("WARNING: ignoring malformed --header value (expected \"Name: value\"): {}", h);
+            eprintln!(
+                "WARNING: ignoring malformed --header value (expected \"Name: value\"): {}",
+                h
+            );
         }
     }
 
@@ -96,13 +99,21 @@ fn build_request_context(cli: &Cli) -> Option<RequestContext> {
     Some(ctx)
 }
 
-async fn import_cookie_file(ctx: &mut Option<RequestContext>, path: &Option<String>, urls: &[String]) {
+async fn import_cookie_file(
+    ctx: &mut Option<RequestContext>,
+    path: &Option<String>,
+    urls: &[String],
+) {
     let Some(path_str) = path else { return };
     let path = PathBuf::from(path_str);
     let contents = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("WARNING: failed to read cookie file {}: {}", path.display(), e);
+            eprintln!(
+                "WARNING: failed to read cookie file {}: {}",
+                path.display(),
+                e
+            );
             return;
         }
     };
@@ -134,7 +145,8 @@ async fn import_cookie_file(ctx: &mut Option<RequestContext>, path: &Option<Stri
             if !name.is_empty() {
                 // Derive domain from the first download URL so the cookie has
                 // meaningful domain context for origin-memory persistence.
-                let domain = urls.first()
+                let domain = urls
+                    .first()
                     .and_then(|u| url::Url::parse(u).ok())
                     .and_then(|u| u.host_str().map(|h| h.to_string()))
                     .unwrap_or_default();
@@ -290,7 +302,10 @@ async fn run_headless(cli: Cli) -> Result<()> {
     while let Some(event) = event_rx.recv().await {
         match event {
             EngineEvent::Progress(id, downloaded, speed) => {
-                println!("progress task={} downloaded={} speed_bps={:.0}", id, downloaded, speed);
+                println!(
+                    "progress task={} downloaded={} speed_bps={:.0}",
+                    id, downloaded, speed
+                );
             }
             EngineEvent::TotalSize(id, total) => {
                 println!("size task={} total_bytes={}", id, total);

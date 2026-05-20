@@ -15,8 +15,8 @@ impl AlignedBuffer {
     pub fn new(len: usize, align: usize) -> Self {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         assert!(len > 0, "aligned buffer length must be non-zero");
-        let layout = std::alloc::Layout::from_size_align(len, align)
-            .expect("valid aligned buffer layout");
+        let layout =
+            std::alloc::Layout::from_size_align(len, align).expect("valid aligned buffer layout");
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = match NonNull::new(ptr) {
             Some(ptr) => ptr,
