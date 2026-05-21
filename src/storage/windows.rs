@@ -78,10 +78,11 @@ pub async fn write_all_at_windows_pwrite(
     use windows_sys::Win32::Storage::FileSystem::{SetFilePointerEx, WriteFile};
 
     let data = data.to_vec();
-    let handle = file.as_raw_handle();
+    let handle = file.as_raw_handle() as usize;
 
     tokio::task::spawn_blocking(move || {
         unsafe {
+            let handle = handle as *mut std::ffi::c_void;
             let mut bytes_written: u32 = 0;
             let li_offset: i64 = offset as i64;
             if SetFilePointerEx(handle, li_offset, std::ptr::null_mut(), 0u32) == 0 {
@@ -120,11 +121,12 @@ pub async fn write_all_at_windows_direct_io(
     let len_aligned = data.len() % DIRECT_IO_ALIGNMENT == 0;
 
     if offset_aligned && ptr_aligned && len_aligned {
-        let handle = file.as_raw_handle();
+        let handle = file.as_raw_handle() as usize;
         let data = data.to_vec();
 
         tokio::task::spawn_blocking(move || {
             unsafe {
+                let handle = handle as *mut std::ffi::c_void;
                 let mut bytes_written: u32 = 0;
                 let mut overlapped: std::mem::MaybeUninit<
                     windows_sys::Win32::System::IO::OVERLAPPED,
