@@ -65,21 +65,23 @@ impl Service<Uri> for TunedConnector {
                 // macOS does not have TCP_QUICKACK or BBR, but it does have:
                 //
                 // 1. TCP_NOPUSH — equivalent of Linux TCP_CORK.
-                //    Batches small sends into full MTU-sized segments.
-                //    The peer TunedConnector calls set_nodelay(true) above,
-                //    so NOPUSH + NODELAY interact as: NOPUSH delays until
-                //    the buffer is full or an explicit push; NODELAY is
-                //    irrelevant when NOPUSH is active. We set NOPUSH so that
-                //    HTTP request headers + body are coalesced into one segment.
-                if let Err(_err) = sock.set_tcp_nopush(true) {
-                    #[cfg(debug_assertions)]
-                    eprintln!("DEBUG: TCP_NOPUSH failed: {}", _err);
+                //    socket2 dropped set_tcp_nopush(); call setsockopt directly.
+                #[allow(unsafe_code)]
+                unsafe {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = sock.as_raw_fd();
+                    let val: libc::c_int = 1;
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_NOPUSH,
+                        &val as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
                 }
 
                 // 2. SO_RCVBUF — macOS autotuning is conservative.
                 //    Bump to 4 MB to match Linux auto-tuning on fast links.
-                //    This is a hint; macOS may cap it to the system max
-                //    (kern.ipc.maxsockbuf, typically 4 MB on modern macOS).
                 if let Err(_err) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
                     #[cfg(debug_assertions)]
                     eprintln!("DEBUG: SO_RCVBUF (macOS) failed: {}", _err);
@@ -108,8 +110,11 @@ impl Service<Uri> for TunedConnector {
                 {
                     use std::os::windows::io::AsRawSocket;
                     const SIO_LOOPBACK_FAST_PATH: u32 = 0x98000010u32;
-                    let raw: std::os::windows::raw::SOCKET = sock.as_raw_socket();
-                    if raw != std::os::windows::raw::INVALID_SOCKET {
+                    // INVALID_SOCKET was removed from std::os::windows::raw in
+                    // Rust 1.x — use the WinSock constant value directly (usize::MAX).
+                    const INVALID_SOCKET: usize = usize::MAX;
+                    let raw = sock.as_raw_socket() as usize;
+                    if raw != INVALID_SOCKET {
                         let mut enabled: u32 = 1;
                         unsafe {
                             let _ = windows_sys::Win32::Networking::WinSock::WSAIoctl(
