@@ -89,10 +89,10 @@ pub async fn write_all_at_windows_pwrite(
             }
             if WriteFile(
                 handle,
-                data.as_ptr() as *const std::ffi::c_void,
+                data.as_ptr(),
                 data.len() as u32,
                 &mut bytes_written,
-                std::ptr::null(),
+                std::ptr::null_mut(),
             ) == 0
             {
                 return Err(anyhow::anyhow!("WriteFile failed"));
@@ -135,7 +135,7 @@ pub async fn write_all_at_windows_direct_io(
 
                 if WriteFile(
                     handle,
-                    data.as_ptr() as *const std::ffi::c_void,
+                    data.as_ptr(),
                     data.len() as u32,
                     &mut bytes_written,
                     ov as *mut _,
