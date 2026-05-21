@@ -842,6 +842,7 @@ impl TurService {
                 }
                 event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
+                    let mut is_terminal = false;
                     let update = match event {
                         EngineEvent::Progress(id, downloaded, speed) => {
                             Some((id, DownloadUpdate::Progress {
@@ -858,15 +859,8 @@ impl TurService {
                         EngineEvent::Protocol(id, protocol) => {
                             Some((id, DownloadUpdate::Protocol(protocol)))
                         }
-                        EngineEvent::StatusChanged(id, DownloadStatus::Completed) => {
-                            let _ = handles.borrow_mut().remove(&id);
-                            Some((id, DownloadUpdate::StatusChanged(DownloadStatus::Completed)))
-                        }
                         EngineEvent::StatusChanged(id, status) => {
-                            let is_terminal = matches!(status, DownloadStatus::Error(_));
-                            if is_terminal {
-                                let _ = handles.borrow_mut().remove(&id);
-                            }
+                            is_terminal = matches!(status, DownloadStatus::Completed | DownloadStatus::Error(_));
                             Some((id, DownloadUpdate::StatusChanged(status)))
                         }
                     };
@@ -874,6 +868,9 @@ impl TurService {
                     if let Some((id, update)) = update {
                         if let Some(tx) = handles.borrow().get(&id) {
                             let _ = tx.send(update);
+                        }
+                        if is_terminal {
+                            let _ = handles.borrow_mut().remove(&id);
                         }
                     }
                 }
