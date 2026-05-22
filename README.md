@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/images/tur.png" alt="Tur Logo" width="80" />
-  <h1>Tur</h1>
-  <p><strong>tur-rs</strong> — A hyper-fast, highly concurrent download manager for Rust.</p>
+  <h1>tur-rs</h1>
+  <p>A hyper-fast, highly concurrent download engine built in Rust.</p>
 </div>
 
 ---
