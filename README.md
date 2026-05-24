@@ -63,9 +63,27 @@ See [`examples/embed.rs`](examples/embed.rs) for a complete runnable example.
 
 ## CLI usage
 
+### Installation
+
+**Fedora (COPR)**
+You can install the CLI from our official COPR repository:
 ```bash
-# Install the binary
+sudo dnf copr enable greykaizen/tur
+sudo dnf install tur
+```
+
+**Arch Linux (AUR)**
+You can easily install the CLI via the Arch User Repository:
+```bash
+yay -S tur-rs
+# or
+paru -S tur-rs
+```
+
+**From Source (Cargo)**
+```bash
 cargo install --path .
+```
 
 # Download a file
 tur --url https://example.com/file.zip

@@ -2592,6 +2592,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "indicatif",
+ "libc",
  "quinn",
  "ratatui",
  "rustix",
