@@ -7,6 +7,7 @@ pub enum DownloadStatus {
     Downloading,
     Paused,
     Stopped,
+    Canceled,
     Completed,
     Error(String),
 }
