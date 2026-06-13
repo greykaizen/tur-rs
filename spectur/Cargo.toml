@@ -5,8 +5,8 @@ edition = "2024"
 description = "The browser-extension-to-download-manager communication layer and stream resolver. Currently used by tur-rs."
 license = "GPL-3.0-only"
 readme = "README.md"
-repository = "https://github.com/greykaizen/spectur"
-homepage = "https://github.com/greykaizen/spectur"
+repository = "https://github.com/greykaizen/tur-rs/tree/main/spectur"
+homepage = "https://github.com/greykaizen/tur-rs"
 
 [dependencies]
 tokio = { version = "1.52", features = ["full"] }
