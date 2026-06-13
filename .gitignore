@@ -6,3 +6,10 @@ tasks/
 benchmarks/
 graphify-out/
 .tur/
+.commandcode/taste/
+
+# Fedora packaging local build files
+packaging/fedora/vendor/
+packaging/fedora/*.tar.zst
+
+plan/

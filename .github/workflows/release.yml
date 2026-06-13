@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  upload-vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate vendor archive
+        run: |
+          chmod +x packaging/fedora/make-sources.sh
+          ./packaging/fedora/make-sources.sh
+
+      - name: Upload vendor archive to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/fedora/vendor-*.tar.zst
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
