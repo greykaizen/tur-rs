@@ -1,0 +1,27 @@
+[package]
+name = "spectur"
+version = "0.4.1"
+edition = "2024"
+description = "The browser-extension-to-download-manager communication layer and stream resolver. Currently used by tur-rs."
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/greykaizen/spectur"
+homepage = "https://github.com/greykaizen/spectur"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-tungstenite = "0.26"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["events"] }
+m3u8-rs = "6.0"
+dash-mpd = "0.20"
+wreq = { version = "6.0.0-rc.29", features = ["gzip", "brotli", "zstd", "deflate", "stream"] }
+wreq-util = "3.0.0-rc.12"
+regex = "1.11"
+futures-util = "0.3"
+url = "2.5"
+mp4 = "0.14"
+arboard = "3.4"

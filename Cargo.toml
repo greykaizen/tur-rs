@@ -20,6 +20,8 @@ default = ["tui"]
 linux-io-uring-experimental = []
 tui = ["ratatui", "crossterm", "indicatif"]
 http3 = ["quinn", "h3", "h3-quinn", "rustls", "webpki-roots"]
+spectur = ["dep:spectur"]
+overlay = ["spectur"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -44,6 +46,7 @@ tokio = { version = "1.52.2", features = ["fs", "full", "io-util", "rt-multi-thr
 tower-service = "0.3.3"
 url = "2.5.7"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
+spectur = { path = "spectur", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Networking_WinSock"] }
@@ -75,3 +78,8 @@ features = ["ring"]
 [dependencies.webpki-roots]
 version = "0.26"
 optional = true
+
+[workspace]
+members = [
+    "spectur",
+]
